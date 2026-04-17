@@ -1,0 +1,916 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.gravitino.job;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mockStatic;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.reflect.FieldUtils;
+import org.apache.gravitino.Config;
+import org.apache.gravitino.Configs;
+import org.apache.gravitino.Entity;
+import org.apache.gravitino.EntityAlreadyExistsException;
+import org.apache.gravitino.EntityStore;
+import org.apache.gravitino.GravitinoEnv;
+import org.apache.gravitino.NameIdentifier;
+import org.apache.gravitino.Namespace;
+import org.apache.gravitino.connector.job.JobExecutor;
+import org.apache.gravitino.exceptions.InUseException;
+import org.apache.gravitino.exceptions.JobTemplateAlreadyExistsException;
+import org.apache.gravitino.exceptions.MetalakeInUseException;
+import org.apache.gravitino.exceptions.NoSuchEntityException;
+import org.apache.gravitino.exceptions.NoSuchJobException;
+import org.apache.gravitino.exceptions.NoSuchJobTemplateException;
+import org.apache.gravitino.exceptions.NoSuchMetalakeException;
+import org.apache.gravitino.lock.LockManager;
+import org.apache.gravitino.meta.AuditInfo;
+import org.apache.gravitino.meta.BaseMetalake;
+import org.apache.gravitino.meta.JobEntity;
+import org.apache.gravitino.meta.JobTemplateEntity;
+import org.apache.gravitino.meta.SchemaVersion;
+import org.apache.gravitino.metalake.MetalakeManager;
+import org.apache.gravitino.storage.IdGenerator;
+import org.apache.gravitino.storage.RandomIdGenerator;
+import org.apache.gravitino.utils.NameIdentifierUtil;
+import org.apache.gravitino.utils.NamespaceUtil;
+import org.awaitility.Awaitility;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+
+public class TestJobManager {
+
+  private JobManager jobManager;
+
+  private EntityStore entityStore;
+
+  private Config config;
+
+  private String testStagingDir;
+
+  private String metalake = "test_metalake";
+
+  private NameIdentifier metalakeIdent = NameIdentifier.of(metalake);
+
+  private MockedStatic<MetalakeManager> mockedMetalake;
+
+  private JobExecutor jobExecutor;
+
+  private IdGenerator idGenerator;
+
+  @BeforeEach
+  public void setUp() throws IllegalAccessException {
+    config = new Config(false) {};
+    testStagingDir = "test_staging_dir_" + UUID.randomUUID().toString();
+    config.set(Configs.JOB_STAGING_DIR, testStagingDir);
+    config.set(Configs.JOB_STAGING_DIR_KEEP_TIME_IN_MS, 1000L);
+
+    FieldUtils.writeField(GravitinoEnv.getInstance(), "lockManager", new LockManager(config), true);
+
+    entityStore = Mockito.mock(EntityStore.class);
+    jobExecutor = Mockito.mock(JobExecutor.class);
+    idGenerator = new RandomIdGenerator();
+    JobManager jm = new JobManager(config, entityStore, idGenerator, jobExecutor);
+    jobManager = Mockito.spy(jm);
+
+    // Stop the background schedulers to prevent interference with tests
+    ScheduledExecutorService cleanUpExecutor = jobManager.cleanUpExecutor;
+    if (cleanUpExecutor != null) {
+      cleanUpExecutor.shutdownNow();
+      try {
+        if (!cleanUpExecutor.awaitTermination(100, TimeUnit.MILLISECONDS)) {
+          cleanUpExecutor.shutdownNow();
+        }
+      } catch (InterruptedException e) {
+        cleanUpExecutor.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
+    }
+
+    ScheduledExecutorService statusPullExecutor = jobManager.statusPullExecutor;
+    if (statusPullExecutor != null) {
+      statusPullExecutor.shutdown();
+      try {
+        if (!statusPullExecutor.awaitTermination(100, TimeUnit.MILLISECONDS)) {
+          statusPullExecutor.shutdownNow();
+        }
+      } catch (InterruptedException e) {
+        statusPullExecutor.shutdownNow();
+        Thread.currentThread().interrupt();
+      }
+    }
+
+    mockedMetalake = mockStatic(MetalakeManager.class);
+  }
+
+  @AfterEach
+  public void tearDown() throws Exception {
+    // Reset mocks to ensure test isolation
+    if (mockedMetalake != null) {
+      mockedMetalake.reset();
+    }
+    Mockito.reset(entityStore, jobManager);
+    // Clean up resources if necessary
+    jobManager.close();
+    FileUtils.deleteDirectory(new File(testStagingDir));
+    if (mockedMetalake != null) {
+      mockedMetalake.close();
+    }
+  }
+
+  @Test
+  public void testListJobTemplates() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+    JobTemplateEntity shellJobTemplate =
+        newShellJobTemplateEntity("shell_job", "A shell job template");
+    JobTemplateEntity sparkJobTemplate =
+        newSparkJobTemplateEntity("spark_job", "A spark job template");
+
+    when(entityStore.list(
+            NamespaceUtil.ofJobTemplate(metalake),
+            JobTemplateEntity.class,
+            Entity.EntityType.JOB_TEMPLATE))
+        .thenReturn(Lists.newArrayList(shellJobTemplate, sparkJobTemplate));
+
+    List<JobTemplateEntity> templates = jobManager.listJobTemplates(metalake);
+    Assertions.assertEquals(2, templates.size());
+    Assertions.assertTrue(templates.contains(shellJobTemplate));
+    Assertions.assertTrue(templates.contains(sparkJobTemplate));
+
+    // Throw exception if metalake does not exist
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(NameIdentifier.of("non_existent"), entityStore))
+        .thenThrow(new NoSuchMetalakeException("Metalake does not exist"));
+
+    Exception e =
+        Assertions.assertThrows(
+            NoSuchMetalakeException.class, () -> jobManager.listJobTemplates("non_existent"));
+    Assertions.assertEquals("Metalake does not exist", e.getMessage());
+
+    // Throw exception if metalake is in use
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenThrow(new MetalakeInUseException("Metalake is in use"));
+
+    e =
+        Assertions.assertThrows(
+            MetalakeInUseException.class, () -> jobManager.listJobTemplates(metalake));
+    Assertions.assertEquals("Metalake is in use", e.getMessage());
+
+    // Throw exception if entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .list(
+            NamespaceUtil.ofJobTemplate(metalake),
+            JobTemplateEntity.class,
+            Entity.EntityType.JOB_TEMPLATE);
+
+    Assertions.assertThrows(RuntimeException.class, () -> jobManager.listJobTemplates(metalake));
+  }
+
+  @Test
+  public void testRegisterJobTemplate() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobTemplateEntity shellJobTemplate =
+        newShellJobTemplateEntity("shell_job", "A shell job template");
+    doNothing().when(entityStore).put(shellJobTemplate, false);
+
+    // Register a new job template
+    Assertions.assertDoesNotThrow(() -> jobManager.registerJobTemplate(metalake, shellJobTemplate));
+
+    // Throw exception if job template already exists
+    doThrow(new EntityAlreadyExistsException("Job template already exists"))
+        .when(entityStore)
+        .put(shellJobTemplate, false /* overwrite */);
+
+    Exception e =
+        Assertions.assertThrows(
+            JobTemplateAlreadyExistsException.class,
+            () -> jobManager.registerJobTemplate(metalake, shellJobTemplate));
+    Assertions.assertEquals(
+        "Job template with name shell_job under metalake test_metalake already exists",
+        e.getMessage());
+
+    // Throw exception if metalake does not exist
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(NameIdentifier.of("non_existent"), entityStore))
+        .thenThrow(new NoSuchMetalakeException("Metalake does not exist"));
+
+    e =
+        Assertions.assertThrows(
+            NoSuchMetalakeException.class,
+            () -> jobManager.registerJobTemplate("non_existent", shellJobTemplate));
+    Assertions.assertEquals("Metalake does not exist", e.getMessage());
+
+    // Throw exception if metalake is in use
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenThrow(new MetalakeInUseException("Metalake is in use"));
+
+    e =
+        Assertions.assertThrows(
+            MetalakeInUseException.class,
+            () -> jobManager.registerJobTemplate(metalake, shellJobTemplate));
+    Assertions.assertEquals("Metalake is in use", e.getMessage());
+
+    // Throw exception if entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .put(shellJobTemplate, false /* overwrite */);
+
+    Assertions.assertThrows(
+        RuntimeException.class, () -> jobManager.registerJobTemplate(metalake, shellJobTemplate));
+  }
+
+  @Test
+  public void testGetJobTemplate() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobTemplateEntity shellJobTemplate =
+        newShellJobTemplateEntity("shell_job", "A shell job template");
+    when(entityStore.get(
+            NameIdentifierUtil.ofJobTemplate(metalake, shellJobTemplate.name()),
+            Entity.EntityType.JOB_TEMPLATE,
+            JobTemplateEntity.class))
+        .thenReturn(shellJobTemplate);
+
+    // Get an existing job template
+    JobTemplateEntity retrievedTemplate = jobManager.getJobTemplate(metalake, "shell_job");
+    Assertions.assertEquals(shellJobTemplate, retrievedTemplate);
+
+    // Throw exception if job template does not exist
+    when(entityStore.get(
+            NameIdentifierUtil.ofJobTemplate(metalake, "non_existent"),
+            Entity.EntityType.JOB_TEMPLATE,
+            JobTemplateEntity.class))
+        .thenThrow(new NoSuchEntityException("Job template does not exist"));
+
+    Exception e =
+        Assertions.assertThrows(
+            NoSuchJobTemplateException.class,
+            () -> jobManager.getJobTemplate(metalake, "non_existent"));
+    Assertions.assertEquals(
+        "Job template with name non_existent under metalake test_metalake does not exist",
+        e.getMessage());
+
+    // Throw exception if entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .get(
+            NameIdentifierUtil.ofJobTemplate(metalake, "job"),
+            Entity.EntityType.JOB_TEMPLATE,
+            JobTemplateEntity.class);
+    Assertions.assertThrows(
+        RuntimeException.class, () -> jobManager.getJobTemplate(metalake, "job"));
+  }
+
+  @Test
+  public void testDeleteJobTemplate() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobTemplateEntity shellJobTemplate =
+        newShellJobTemplateEntity("shell_job", "A shell job template");
+    doReturn(true)
+        .when(entityStore)
+        .delete(
+            NameIdentifierUtil.ofJobTemplate(metalake, shellJobTemplate.name()),
+            Entity.EntityType.JOB_TEMPLATE);
+
+    doReturn(Collections.emptyList())
+        .when(jobManager)
+        .listJobs(metalake, Optional.of(shellJobTemplate.name()));
+
+    // Delete an existing job template
+    Assertions.assertTrue(() -> jobManager.deleteJobTemplate(metalake, "shell_job"));
+
+    doReturn(false)
+        .when(entityStore)
+        .delete(
+            NameIdentifierUtil.ofJobTemplate(metalake, "shell_job"),
+            Entity.EntityType.JOB_TEMPLATE);
+
+    // Delete a non-existing job template
+    Assertions.assertFalse(() -> jobManager.deleteJobTemplate(metalake, "shell_job"));
+
+    // Throw exception if entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .delete(NameIdentifierUtil.ofJobTemplate(metalake, "job"), Entity.EntityType.JOB_TEMPLATE);
+    Assertions.assertThrows(
+        RuntimeException.class, () -> jobManager.deleteJobTemplate(metalake, "job"));
+
+    // Delete job template that is in use
+    Lists.newArrayList(
+            JobHandle.Status.QUEUED, JobHandle.Status.STARTED, JobHandle.Status.CANCELLING)
+        .forEach(
+            status -> {
+              doReturn(Lists.newArrayList(newJobEntity("shell_job", status)))
+                  .when(jobManager)
+                  .listJobs(metalake, Optional.of(shellJobTemplate.name()));
+              Assertions.assertThrows(
+                  InUseException.class, () -> jobManager.deleteJobTemplate(metalake, "shell_job"));
+            });
+
+    // Delete job template that is not in use
+    Lists.newArrayList(
+            JobHandle.Status.CANCELLED, JobHandle.Status.FAILED, JobHandle.Status.SUCCEEDED)
+        .forEach(
+            status -> {
+              doReturn(Lists.newArrayList(newJobEntity("shell_job", status)))
+                  .when(jobManager)
+                  .listJobs(metalake, Optional.of(shellJobTemplate.name()));
+              Assertions.assertDoesNotThrow(
+                  () -> jobManager.deleteJobTemplate(metalake, "shell_job"));
+            });
+  }
+
+  @Test
+  public void testListJobs() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobTemplateEntity shellJobTemplate =
+        newShellJobTemplateEntity("shell_job", "A shell job template");
+    when(jobManager.getJobTemplate(metalake, shellJobTemplate.name())).thenReturn(shellJobTemplate);
+
+    JobEntity job1 = newJobEntity("shell_job", JobHandle.Status.QUEUED);
+    JobEntity job2 = newJobEntity("spark_job", JobHandle.Status.QUEUED);
+
+    String[] levels =
+        ArrayUtils.add(shellJobTemplate.namespace().levels(), shellJobTemplate.name());
+    Namespace jobTemplateIdentNs = Namespace.of(levels);
+    when(entityStore.list(jobTemplateIdentNs, JobEntity.class, Entity.EntityType.JOB))
+        .thenReturn(Lists.newArrayList(job1));
+
+    List<JobEntity> jobs = jobManager.listJobs(metalake, Optional.of(shellJobTemplate.name()));
+    Assertions.assertEquals(1, jobs.size());
+    Assertions.assertTrue(jobs.contains(job1));
+    Assertions.assertFalse(jobs.contains(job2));
+
+    // List all jobs without filtering by job template
+    // Mock the listJobs method to return a list of jobs associated with the job template
+    when(entityStore.list(NamespaceUtil.ofJob(metalake), JobEntity.class, Entity.EntityType.JOB))
+        .thenReturn(Lists.newArrayList(job1, job2));
+
+    jobs = jobManager.listJobs(metalake, Optional.empty());
+    Assertions.assertEquals(2, jobs.size());
+    Assertions.assertTrue(jobs.contains(job1));
+    Assertions.assertTrue(jobs.contains(job2));
+
+    // Throw exception if job template does not exist
+    when(jobManager.getJobTemplate(metalake, "non_existent"))
+        .thenThrow(new NoSuchJobTemplateException("Job template does not exist"));
+
+    Exception e =
+        Assertions.assertThrows(
+            NoSuchJobTemplateException.class,
+            () -> jobManager.listJobs(metalake, Optional.of("non_existent")));
+    Assertions.assertEquals("Job template does not exist", e.getMessage());
+
+    // Throw exception if entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .list(NamespaceUtil.ofJob(metalake), JobEntity.class, Entity.EntityType.JOB);
+    Assertions.assertThrows(
+        RuntimeException.class, () -> jobManager.listJobs(metalake, Optional.empty()));
+  }
+
+  @Test
+  public void testGetJob() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobEntity job = newJobEntity("shell_job", JobHandle.Status.QUEUED);
+    when(entityStore.get(
+            NameIdentifierUtil.ofJob(metalake, job.name()), Entity.EntityType.JOB, JobEntity.class))
+        .thenReturn(job);
+
+    // Get an existing job
+    JobEntity retrievedJob = jobManager.getJob(metalake, job.name());
+    Assertions.assertEquals(job, retrievedJob);
+
+    // Throw exception if job does not exist
+    when(entityStore.get(
+            NameIdentifierUtil.ofJob(metalake, "non_existent"),
+            Entity.EntityType.JOB,
+            JobEntity.class))
+        .thenThrow(new NoSuchEntityException("Job does not exist"));
+
+    Exception e =
+        Assertions.assertThrows(
+            NoSuchJobException.class, () -> jobManager.getJob(metalake, "non_existent"));
+    Assertions.assertEquals(
+        "Job with ID non_existent under metalake test_metalake does not exist", e.getMessage());
+
+    // Throw exception if entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .get(NameIdentifierUtil.ofJob(metalake, "job"), Entity.EntityType.JOB, JobEntity.class);
+    Assertions.assertThrows(RuntimeException.class, () -> jobManager.getJob(metalake, "job"));
+  }
+
+  @Test
+  public void testRunJob() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobTemplateEntity shellJobTemplate =
+        newShellJobTemplateEntity("shell_job", "A shell job template");
+    when(jobManager.getJobTemplate(metalake, shellJobTemplate.name())).thenReturn(shellJobTemplate);
+
+    String jobExecutionId = "job_execution_id_for_test";
+    when(jobExecutor.submitJob(any())).thenReturn(jobExecutionId);
+
+    doNothing().when(entityStore).put(any(JobEntity.class), anyBoolean());
+
+    JobEntity jobEntity = jobManager.runJob(metalake, "shell_job", Collections.emptyMap());
+
+    Assertions.assertEquals(jobExecutionId, jobEntity.jobExecutionId());
+    Assertions.assertEquals("shell_job", jobEntity.jobTemplateName());
+    Assertions.assertEquals(JobHandle.Status.QUEUED, jobEntity.status());
+
+    // Test when job template does not exist
+    when(jobManager.getJobTemplate(metalake, "non_existent"))
+        .thenThrow(new NoSuchJobTemplateException("Job template does not exist"));
+
+    Exception e =
+        Assertions.assertThrows(
+            NoSuchJobTemplateException.class,
+            () -> jobManager.runJob(metalake, "non_existent", Collections.emptyMap()));
+    Assertions.assertEquals("Job template does not exist", e.getMessage());
+
+    // Test when job executor fails
+    doThrow(new RuntimeException("Job executor error")).when(jobExecutor).submitJob(any());
+
+    Assertions.assertThrows(
+        RuntimeException.class,
+        () -> jobManager.runJob(metalake, "shell_job", Collections.emptyMap()));
+
+    // Test when entity store fails
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .put(any(JobEntity.class), anyBoolean());
+
+    Assertions.assertThrows(
+        RuntimeException.class,
+        () -> jobManager.runJob(metalake, "shell_job", Collections.emptyMap()));
+  }
+
+  @Test
+  public void testCancelJob() throws IOException {
+    mockedMetalake
+        .when(() -> MetalakeManager.checkMetalake(metalakeIdent, entityStore))
+        .thenAnswer(a -> null);
+
+    JobEntity job = newJobEntity("shell_job", JobHandle.Status.QUEUED);
+    when(jobManager.getJob(metalake, job.name())).thenReturn(job);
+    doNothing().when(jobExecutor).cancelJob(job.jobExecutionId());
+    doNothing().when(entityStore).put(any(JobEntity.class), anyBoolean());
+
+    // Cancel an existing job
+    JobEntity cancelledJob = jobManager.cancelJob(metalake, job.name());
+    Assertions.assertEquals(job.jobExecutionId(), cancelledJob.jobExecutionId());
+    Assertions.assertEquals(JobHandle.Status.CANCELLING, cancelledJob.status());
+
+    // Test cancel a nonexistent job
+    when(jobManager.getJob(metalake, "non_existent"))
+        .thenThrow(new NoSuchJobException("Job does not exist"));
+
+    Exception e =
+        Assertions.assertThrows(
+            NoSuchJobException.class, () -> jobManager.cancelJob(metalake, "non_existent"));
+    Assertions.assertEquals("Job does not exist", e.getMessage());
+
+    // Test cancelling a finished job
+    Lists.newArrayList(
+            JobHandle.Status.CANCELLED, JobHandle.Status.FAILED, JobHandle.Status.SUCCEEDED)
+        .forEach(
+            status -> {
+              JobEntity finishedJob = newJobEntity("shell_job", status);
+              when(jobManager.getJob(metalake, finishedJob.name())).thenReturn(finishedJob);
+
+              JobEntity cancelledFinishedJob = jobManager.cancelJob(metalake, finishedJob.name());
+              Assertions.assertEquals(
+                  finishedJob.jobExecutionId(), cancelledFinishedJob.jobExecutionId());
+              Assertions.assertEquals(status, cancelledFinishedJob.status());
+            });
+
+    // Test job executor failed to cancel the job
+    doThrow(new RuntimeException("Job executor error"))
+        .when(jobExecutor)
+        .cancelJob(job.jobExecutionId());
+    Assertions.assertThrows(
+        RuntimeException.class, () -> jobManager.cancelJob(metalake, job.name()));
+
+    // Test when entity store failed to update the job status
+    doThrow(new IOException("Entity store error"))
+        .when(entityStore)
+        .put(any(JobEntity.class), anyBoolean());
+
+    Assertions.assertThrows(
+        RuntimeException.class, () -> jobManager.cancelJob(metalake, job.name()));
+  }
+
+  @Test
+  public void testPullJobStatus() throws IOException {
+    JobEntity job = newJobEntity("shell_job", JobHandle.Status.QUEUED);
+    BaseMetalake mockMetalake =
+        BaseMetalake.builder()
+            .withName(metalake)
+            .withId(idGenerator.nextId())
+            .withVersion(SchemaVersion.V_0_1)
+            .withAuditInfo(AuditInfo.EMPTY)
+            .build();
+    when(entityStore.list(Namespace.empty(), BaseMetalake.class, Entity.EntityType.METALAKE))
+        .thenReturn(ImmutableList.of(mockMetalake));
+
+    // Mock MetalakeManager.listInUseMetalakes to return the test metalake
+    mockedMetalake
+        .when(() -> MetalakeManager.listInUseMetalakes(entityStore))
+        .thenReturn(ImmutableList.of(metalake));
+
+    when(jobManager.listJobs(metalake, Optional.empty())).thenReturn(ImmutableList.of(job));
+
+    when(jobExecutor.getJobStatus(job.jobExecutionId())).thenReturn(JobHandle.Status.QUEUED);
+    Assertions.assertDoesNotThrow(() -> jobManager.pullAndUpdateJobStatus());
+    verify(entityStore, never()).put(any(), anyBoolean());
+
+    when(jobExecutor.getJobStatus(job.jobExecutionId())).thenReturn(JobHandle.Status.SUCCEEDED);
+    Assertions.assertDoesNotThrow(() -> jobManager.pullAndUpdateJobStatus());
+    verify(entityStore, times(1)).put(any(JobEntity.class), anyBoolean());
+  }
+
+  @Test
+  public void testCleanUpStagingDirs() throws IOException, InterruptedException {
+    JobEntity job = newJobEntity("shell_job", JobHandle.Status.STARTED);
+    BaseMetalake mockMetalake =
+        BaseMetalake.builder()
+            .withName(metalake)
+            .withId(idGenerator.nextId())
+            .withVersion(SchemaVersion.V_0_1)
+            .withAuditInfo(AuditInfo.EMPTY)
+            .build();
+    when(entityStore.list(Namespace.empty(), BaseMetalake.class, Entity.EntityType.METALAKE))
+        .thenReturn(ImmutableList.of(mockMetalake));
+
+    // Mock MetalakeManager.listInUseMetalakes to return the test metalake
+    mockedMetalake
+        .when(() -> MetalakeManager.listInUseMetalakes(entityStore))
+        .thenReturn(ImmutableList.of(metalake));
+
+    when(jobManager.listJobs(metalake, Optional.empty())).thenReturn(ImmutableList.of(job));
+    Assertions.assertDoesNotThrow(() -> jobManager.cleanUpStagingDirs());
+    verify(entityStore, never()).delete(any(), any());
+
+    JobEntity finishedJob = newJobEntity("shell_job", JobHandle.Status.SUCCEEDED);
+    when(jobManager.listJobs(metalake, Optional.empty())).thenReturn(ImmutableList.of(finishedJob));
+
+    Awaitility.await()
+        .atMost(3, TimeUnit.SECONDS)
+        .until(
+            () -> {
+              Assertions.assertDoesNotThrow(() -> jobManager.cleanUpStagingDirs());
+              try {
+                verify(entityStore, times(1)).delete(any(), any());
+                return true;
+              } catch (Throwable e) {
+                return false;
+              }
+            });
+  }
+
+  @Test
+  public void testUpdateShellJobTemplateEntity() {
+    String jobTemplateName = "old_shell_job";
+    String jobTemplateComment = "An old shell job template";
+    JobTemplateEntity oldJobTemplateEntity =
+        newShellJobTemplateEntity(jobTemplateName, jobTemplateComment);
+
+    // Update name and comment
+    String newJobTemplateName = "new_shell_job";
+    String newJobTemplateComment = "A new shell job template";
+    JobTemplateChange rename = JobTemplateChange.rename(newJobTemplateName);
+    JobTemplateChange updateComment = JobTemplateChange.updateComment(newJobTemplateComment);
+
+    JobTemplateEntity newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, rename, updateComment);
+
+    Assertions.assertEquals(oldJobTemplateEntity.id(), newJobTemplateEntity.id());
+    Assertions.assertEquals(newJobTemplateName, newJobTemplateEntity.name());
+    Assertions.assertEquals(oldJobTemplateEntity.namespace(), newJobTemplateEntity.namespace());
+    Assertions.assertEquals(newJobTemplateComment, newJobTemplateEntity.comment());
+    Assertions.assertEquals(
+        oldJobTemplateEntity.templateContent(), newJobTemplateEntity.templateContent());
+
+    // Update the executable of the shell job template
+    JobTemplateChange updateShellTemplate =
+        JobTemplateChange.updateTemplate(
+            JobTemplateChange.ShellTemplateUpdate.builder().withNewExecutable("/bin/ls").build());
+
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, updateShellTemplate);
+    Assertions.assertEquals(oldJobTemplateEntity.id(), newJobTemplateEntity.id());
+    Assertions.assertEquals(oldJobTemplateEntity.name(), newJobTemplateEntity.name());
+    Assertions.assertEquals(oldJobTemplateEntity.namespace(), newJobTemplateEntity.namespace());
+    Assertions.assertEquals(oldJobTemplateEntity.comment(), newJobTemplateEntity.comment());
+    Assertions.assertNotEquals(
+        oldJobTemplateEntity.templateContent(), newJobTemplateEntity.templateContent());
+    JobTemplateEntity.TemplateContent oldContent = oldJobTemplateEntity.templateContent();
+    JobTemplateEntity.TemplateContent newContent = newJobTemplateEntity.templateContent();
+    Assertions.assertEquals(oldContent.jobType(), newContent.jobType());
+    Assertions.assertEquals("/bin/ls", newContent.executable());
+    Assertions.assertEquals(oldContent.arguments(), newContent.arguments());
+    Assertions.assertEquals(oldContent.environments(), newContent.environments());
+    Assertions.assertEquals(oldContent.customFields(), newContent.customFields());
+
+    // Update the arguments, environments, custom fields of the shell job template
+    JobTemplateChange updateShellTemplate2 =
+        JobTemplateChange.updateTemplate(
+            JobTemplateChange.ShellTemplateUpdate.builder()
+                .withNewArguments(ImmutableList.of("arg1", "arg2"))
+                .withNewEnvironments(Collections.singletonMap("env1", "value1"))
+                .withNewCustomFields(Collections.singletonMap("field1", "value1"))
+                .build());
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, updateShellTemplate2);
+
+    JobTemplateEntity.TemplateContent newContent2 = newJobTemplateEntity.templateContent();
+    Assertions.assertEquals(oldContent.jobType(), newContent2.jobType());
+    Assertions.assertEquals(oldContent.executable(), newContent2.executable());
+    Assertions.assertEquals(ImmutableList.of("arg1", "arg2"), newContent2.arguments());
+    Assertions.assertEquals(Collections.singletonMap("env1", "value1"), newContent2.environments());
+    Assertions.assertEquals(
+        Collections.singletonMap("field1", "value1"), newContent2.customFields());
+    Assertions.assertEquals(oldContent.scripts(), newContent2.scripts());
+
+    // Update the scripts of the shell job template
+    JobTemplateChange updateShellTemplate3 =
+        JobTemplateChange.updateTemplate(
+            JobTemplateChange.ShellTemplateUpdate.builder()
+                .withNewScripts(ImmutableList.of("echo Hello", "echo World"))
+                .build());
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, updateShellTemplate3);
+
+    JobTemplateEntity.TemplateContent newContent3 = newJobTemplateEntity.templateContent();
+    Assertions.assertEquals(oldContent.jobType(), newContent3.jobType());
+    Assertions.assertEquals(oldContent.executable(), newContent3.executable());
+    Assertions.assertEquals(oldContent.arguments(), newContent3.arguments());
+    Assertions.assertEquals(oldContent.environments(), newContent3.environments());
+    Assertions.assertEquals(oldContent.customFields(), newContent3.customFields());
+    Assertions.assertEquals(ImmutableList.of("echo Hello", "echo World"), newContent3.scripts());
+
+    // Update with no changes
+    JobTemplateChange noChange =
+        JobTemplateChange.updateTemplate(JobTemplateChange.ShellTemplateUpdate.builder().build());
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, noChange);
+    Assertions.assertEquals(
+        oldJobTemplateEntity.templateContent(), newJobTemplateEntity.templateContent());
+
+    // Update job template with SparkJobTemplateChange should throw IllegalArgumentException
+    JobTemplateChange invalidChange =
+        JobTemplateChange.updateTemplate(JobTemplateChange.SparkTemplateUpdate.builder().build());
+    Assertions.assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            jobManager.updateJobTemplateEntity(
+                oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, invalidChange));
+  }
+
+  @Test
+  public void testUpdateSparkJobTemplateEntity() {
+    String jobTemplateName = "old_spark_job";
+    String jobTemplateComment = "An old spark job template";
+    JobTemplateEntity oldJobTemplateEntity =
+        newSparkJobTemplateEntity(jobTemplateName, jobTemplateComment);
+
+    // Update the executable and class name of the spark job template
+    JobTemplateChange updateSparkTemplate =
+        JobTemplateChange.updateTemplate(
+            JobTemplateChange.SparkTemplateUpdate.builder()
+                .withNewExecutable("file:/new/path/to/spark-examples.jar")
+                .withNewClassName("org.apache.spark.examples.SparkWordCount")
+                .build());
+    JobTemplateEntity newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, updateSparkTemplate);
+    Assertions.assertEquals(oldJobTemplateEntity.id(), newJobTemplateEntity.id());
+    Assertions.assertEquals(oldJobTemplateEntity.name(), newJobTemplateEntity.name());
+    Assertions.assertEquals(oldJobTemplateEntity.namespace(), newJobTemplateEntity.namespace());
+    Assertions.assertEquals(oldJobTemplateEntity.comment(), newJobTemplateEntity.comment());
+    Assertions.assertNotEquals(
+        oldJobTemplateEntity.templateContent(), newJobTemplateEntity.templateContent());
+    JobTemplateEntity.TemplateContent oldContent = oldJobTemplateEntity.templateContent();
+    JobTemplateEntity.TemplateContent newContent = newJobTemplateEntity.templateContent();
+    Assertions.assertEquals(oldContent.jobType(), newContent.jobType());
+    Assertions.assertEquals("file:/new/path/to/spark-examples.jar", newContent.executable());
+    Assertions.assertEquals("org.apache.spark.examples.SparkWordCount", newContent.className());
+    Assertions.assertEquals(oldContent.arguments(), newContent.arguments());
+    Assertions.assertEquals(oldContent.environments(), newContent.environments());
+    Assertions.assertEquals(oldContent.customFields(), newContent.customFields());
+    Assertions.assertEquals(oldContent.jars(), newContent.jars());
+    Assertions.assertEquals(oldContent.files(), newContent.files());
+    Assertions.assertEquals(oldContent.archives(), newContent.archives());
+    Assertions.assertEquals(oldContent.configs(), newContent.configs());
+
+    // Update the arguments, environments, custom fields of the spark job template
+    JobTemplateChange updateSparkTemplate2 =
+        JobTemplateChange.updateTemplate(
+            JobTemplateChange.SparkTemplateUpdate.builder()
+                .withNewArguments(ImmutableList.of("arg1", "arg2"))
+                .withNewEnvironments(Collections.singletonMap("env1", "value1"))
+                .withNewCustomFields(Collections.singletonMap("field1", "value1"))
+                .build());
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, updateSparkTemplate2);
+    JobTemplateEntity.TemplateContent newContent2 = newJobTemplateEntity.templateContent();
+    Assertions.assertEquals(oldContent.jobType(), newContent2.jobType());
+    Assertions.assertEquals(oldContent.executable(), newContent2.executable());
+    Assertions.assertEquals(oldContent.className(), newContent2.className());
+    Assertions.assertEquals(ImmutableList.of("arg1", "arg2"), newContent2.arguments());
+    Assertions.assertEquals(Collections.singletonMap("env1", "value1"), newContent2.environments());
+    Assertions.assertEquals(
+        Collections.singletonMap("field1", "value1"), newContent2.customFields());
+    Assertions.assertEquals(oldContent.jars(), newContent2.jars());
+    Assertions.assertEquals(oldContent.files(), newContent2.files());
+    Assertions.assertEquals(oldContent.archives(), newContent2.archives());
+    Assertions.assertEquals(oldContent.configs(), newContent2.configs());
+
+    // Update the jars, files, archives, configs of the spark job template
+    JobTemplateChange updateSparkTemplate3 =
+        JobTemplateChange.updateTemplate(
+            JobTemplateChange.SparkTemplateUpdate.builder()
+                .withNewJars(ImmutableList.of("file:/new/path/to/jar1 ", "file:/new/path/to/jar2"))
+                .withNewFiles(
+                    ImmutableList.of("file:/new/path/to/file1", "file:/new/path/to/file2"))
+                .withNewArchives(
+                    ImmutableList.of("file:/new/path/to/archive1", "file:/new/path/to/archive2"))
+                .withNewConfigs(Collections.singletonMap("spark.executor.memory", "4g"))
+                .build());
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, updateSparkTemplate3);
+    JobTemplateEntity.TemplateContent newContent3 = newJobTemplateEntity.templateContent();
+    Assertions.assertEquals(oldContent.jobType(), newContent3.jobType());
+    Assertions.assertEquals(oldContent.executable(), newContent3.executable());
+    Assertions.assertEquals(oldContent.className(), newContent3.className());
+    Assertions.assertEquals(oldContent.arguments(), newContent3.arguments());
+    Assertions.assertEquals(oldContent.environments(), newContent3.environments());
+    Assertions.assertEquals(oldContent.customFields(), newContent3.customFields());
+    Assertions.assertEquals(
+        ImmutableList.of("file:/new/path/to/jar1 ", "file:/new/path/to/jar2"), newContent3.jars());
+    Assertions.assertEquals(
+        ImmutableList.of("file:/new/path/to/file1", "file:/new/path/to/file2"),
+        newContent3.files());
+    Assertions.assertEquals(
+        ImmutableList.of("file:/new/path/to/archive1", "file:/new/path/to/archive2"),
+        newContent3.archives());
+    Assertions.assertEquals(
+        Collections.singletonMap("spark.executor.memory", "4g"), newContent3.configs());
+
+    // Update with no changes
+    JobTemplateChange noChange =
+        JobTemplateChange.updateTemplate(JobTemplateChange.SparkTemplateUpdate.builder().build());
+    newJobTemplateEntity =
+        jobManager.updateJobTemplateEntity(
+            oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, noChange);
+    Assertions.assertEquals(
+        oldJobTemplateEntity.templateContent(), newJobTemplateEntity.templateContent());
+
+    // Update job template with ShellJobTemplateChange should throw IllegalArgumentException
+    JobTemplateChange invalidChange =
+        JobTemplateChange.updateTemplate(JobTemplateChange.ShellTemplateUpdate.builder().build());
+    Assertions.assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            jobManager.updateJobTemplateEntity(
+                oldJobTemplateEntity.nameIdentifier(), oldJobTemplateEntity, invalidChange));
+  }
+
+  private JobTemplateEntity newShellJobTemplateEntity(String name, String comment) {
+    ShellJobTemplate shellJobTemplate =
+        ShellJobTemplate.builder()
+            .withName(name)
+            .withComment(comment)
+            .withExecutable("/bin/echo")
+            .build();
+
+    Random rand = new Random();
+    return JobTemplateEntity.builder()
+        .withId(rand.nextLong())
+        .withName(name)
+        .withNamespace(NamespaceUtil.ofJobTemplate(metalake))
+        .withTemplateContent(JobTemplateEntity.TemplateContent.fromJobTemplate(shellJobTemplate))
+        .withAuditInfo(
+            AuditInfo.builder().withCreator("test").withCreateTime(Instant.now()).build())
+        .build();
+  }
+
+  private JobTemplateEntity newSparkJobTemplateEntity(String name, String comment) {
+    SparkJobTemplate sparkJobTemplate =
+        SparkJobTemplate.builder()
+            .withName(name)
+            .withComment(comment)
+            .withClassName("org.apache.spark.examples.SparkPi")
+            .withExecutable("file:/path/to/spark-examples.jar")
+            .build();
+
+    Random rand = new Random();
+    return JobTemplateEntity.builder()
+        .withId(rand.nextLong())
+        .withName(name)
+        .withNamespace(NamespaceUtil.ofJobTemplate(metalake))
+        .withTemplateContent(JobTemplateEntity.TemplateContent.fromJobTemplate(sparkJobTemplate))
+        .withAuditInfo(
+            AuditInfo.builder().withCreator("test").withCreateTime(Instant.now()).build())
+        .build();
+  }
+
+  private JobEntity newJobEntity(String templateName, JobHandle.Status status) {
+    Random rand = new Random();
+    return JobEntity.builder()
+        .withId(rand.nextLong())
+        .withJobExecutionId(rand.nextLong() + "")
+        .withNamespace(NamespaceUtil.ofJob(metalake))
+        .withJobTemplateName(templateName)
+        .withFinishedAt(System.currentTimeMillis())
+        .withStatus(status)
+        .withAuditInfo(
+            AuditInfo.builder().withCreator("test").withCreateTime(Instant.now()).build())
+        .build();
+  }
+
+  @Test
+  public void testFetchFileFromUriWithMissingLocalFileShouldFail() throws IOException {
+    File stagingDir = new File(testStagingDir);
+    Assertions.assertTrue(stagingDir.mkdirs() || stagingDir.exists());
+
+    Path missingFilePath =
+        Path.of(System.getProperty("java.io.tmpdir"), "missing-job-file-" + UUID.randomUUID());
+    String uri = missingFilePath.toUri().toString();
+
+    Assertions.assertThrows(
+        RuntimeException.class, () -> JobManager.fetchFileFromUri(uri, stagingDir, 1000));
+  }
+}

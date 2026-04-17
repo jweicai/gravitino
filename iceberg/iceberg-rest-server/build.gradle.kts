@@ -1,0 +1,213 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+description = "iceberg-rest-service"
+
+plugins {
+  `maven-publish`
+  id("java")
+  id("idea")
+}
+
+val scalaVersion: String = project.properties["scalaVersion"] as? String ?: extra["defaultScalaVersion"].toString()
+val sparkVersion: String = libs.versions.spark34.get()
+val sparkMajorVersion: String = sparkVersion.substringBeforeLast(".")
+val icebergVersion: String = libs.versions.iceberg.get()
+val scalaCollectionCompatVersion: String = libs.versions.scala.collection.compat.get()
+
+dependencies {
+  implementation(project(":api"))
+  implementation(project(":bundles:aliyun"))
+  implementation(project(":bundles:aws"))
+  implementation(project(":bundles:azure"))
+  implementation(project(":bundles:gcp"))
+  implementation(project(":catalogs:catalog-common"))
+  implementation(project(":clients:client-java"))
+  implementation(project(":core")) {
+    exclude("*")
+  }
+  implementation(project(":common")) {
+    exclude("*")
+  }
+  implementation(project(":iceberg:iceberg-common"))
+  implementation(project(":server-common")) {
+    exclude("*")
+  }
+  implementation(libs.bundles.iceberg)
+  implementation(libs.bundles.jetty)
+  implementation(libs.bundles.jersey)
+  implementation(libs.bundles.jwt)
+  implementation(libs.bundles.log4j)
+  implementation(libs.bundles.metrics)
+  implementation(libs.bundles.prometheus)
+  implementation(libs.caffeine)
+  implementation(libs.cglib) {
+    // The version of build-in asm is 7.1, which is not compatible with Java 17 well
+    exclude("org.ow2.asm")
+  }
+  implementation(libs.commons.dbcp2)
+  implementation(libs.commons.lang3)
+  implementation(libs.concurrent.trees)
+  implementation(libs.guava)
+  implementation(libs.jackson.annotations)
+  implementation(libs.jackson.databind)
+  implementation(libs.jackson.datatype.jdk8)
+  implementation(libs.jackson.datatype.jsr310)
+  implementation(libs.jcasbin) {
+    exclude(group = "com.fasterxml.jackson.core", module = "jackson-databind")
+  }
+  implementation(libs.metrics.jersey2)
+  implementation(libs.mybatis)
+  implementation(libs.ognl)
+
+  annotationProcessor(libs.lombok)
+  compileOnly(libs.lombok)
+
+  testImplementation(project(":bundles:iceberg-aliyun-bundle"))
+  testImplementation(project(":bundles:iceberg-aws-bundle"))
+  testImplementation(project(":bundles:iceberg-gcp-bundle"))
+  testImplementation(project(":bundles:iceberg-azure-bundle"))
+  testImplementation(project(":integration-test-common", "testArtifacts"))
+  testImplementation(project(":server"))
+
+  testImplementation("org.scala-lang.modules:scala-collection-compat_$scalaVersion:$scalaCollectionCompatVersion")
+  testImplementation("org.apache.iceberg:iceberg-spark-runtime-${sparkMajorVersion}_$scalaVersion:$icebergVersion")
+  testImplementation("org.apache.spark:spark-sql_$scalaVersion:$sparkVersion") {
+    exclude("org.apache.avro")
+    exclude("org.apache.hadoop")
+    exclude("org.apache.zookeeper")
+    exclude("io.dropwizard.metrics")
+    exclude("org.rocksdb")
+  }
+
+  testImplementation(libs.awaitility)
+  testImplementation(libs.h2db)
+  testImplementation(libs.mysql.driver)
+  testImplementation(libs.postgresql.driver)
+  testImplementation(libs.jersey.test.framework.core) {
+    exclude(group = "org.junit.jupiter")
+  }
+  testImplementation(libs.jersey.test.framework.provider.jetty) {
+    exclude(group = "org.junit.jupiter")
+  }
+  testImplementation(libs.junit.jupiter.api)
+  testImplementation(libs.junit.jupiter.params)
+  testImplementation(libs.mockito.core)
+  testImplementation(libs.mysql.driver)
+  testImplementation(libs.postgresql.driver)
+  testImplementation(libs.sqlite.jdbc)
+  testImplementation(libs.slf4j.api)
+  testImplementation(libs.testcontainers)
+  testImplementation(libs.cglib) {
+    // The version of build-in asm is 7.1, which is not compatible with Java 17 well
+    exclude("org.ow2.asm")
+  }
+  testImplementation(libs.asm)
+  testImplementation(libs.testcontainers.postgresql)
+
+  // Add Hadoop 3.3+ dependencies since Spark's Hadoop is excluded
+  // Required for Iceberg 1.10+ which uses newer Hadoop APIs like FileSystem.openFile()
+  testImplementation(libs.hadoop3.client.api)
+  testImplementation(libs.hadoop3.client.runtime)
+
+  testRuntimeOnly(libs.junit.jupiter.engine)
+}
+
+tasks {
+  val copyDepends by registering(Copy::class) {
+    from(configurations.runtimeClasspath)
+    into("build/libs")
+  }
+  jar {
+    finalizedBy(copyDepends)
+  }
+
+  register("copyLibs", Copy::class) {
+    dependsOn(copyDepends, "build")
+    from("build/libs")
+    into("$rootDir/distribution/package/iceberg-rest-server/libs")
+  }
+
+  register("copyLibsToStandalonePackage", Copy::class) {
+    dependsOn(copyDepends, "build")
+    from("build/libs")
+    into("$rootDir/distribution/gravitino-iceberg-rest-server/libs")
+  }
+
+  register("copyConfigs", Copy::class) {
+    from("src/main/resources")
+    into("$rootDir/distribution/package/iceberg-rest-server/conf")
+
+    include("core-site.xml.template")
+    include("hdfs-site.xml.template")
+
+    rename { original ->
+      if (original.endsWith(".template")) {
+        original.replace(".template", "")
+      } else {
+        original
+      }
+    }
+
+    fileMode = 0b111101101
+  }
+
+  register("copyConfigsToStandalonePackage", Copy::class) {
+    from("src/main/resources")
+    into("$rootDir/distribution/gravitino-iceberg-rest-server/conf")
+
+    include("core-site.xml.template")
+    include("hdfs-site.xml.template")
+
+    rename { original ->
+      if (original.endsWith(".template")) {
+        original.replace(".template", "")
+      } else {
+        original
+      }
+    }
+
+    fileMode = 0b111101101
+  }
+
+  register("copyLibAndConfigs", Copy::class) {
+    dependsOn("copyLibs", "copyConfigs")
+  }
+
+  register("copyLibAndConfigsToStandalonePackage", Copy::class) {
+    dependsOn("copyLibsToStandalonePackage", "copyConfigsToStandalonePackage")
+  }
+}
+
+tasks.test {
+  val skipITs = project.hasProperty("skipITs")
+  if (skipITs) {
+    // Exclude integration tests
+    exclude("**/integration/test/**")
+  } else {
+    dependsOn(tasks.jar)
+  }
+}
+
+tasks.clean {
+  delete("spark-warehouse")
+}
+
+tasks.getByName("generateMetadataFileForMavenJavaPublication") {
+  dependsOn("copyDepends")
+}

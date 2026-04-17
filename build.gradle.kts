@@ -1,0 +1,1324 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+import com.github.gradle.node.NodeExtension
+import com.github.gradle.node.NodePlugin
+import com.github.jk1.license.filter.DependencyFilter
+import com.github.jk1.license.filter.LicenseBundleNormalizer
+import com.github.jk1.license.render.InventoryHtmlReportRenderer
+import com.github.jk1.license.render.ReportRenderer
+import com.github.vlsi.gradle.dsl.configureEach
+import net.ltgt.gradle.errorprone.errorprone
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.internal.hash.ChecksumService
+import org.gradle.internal.os.OperatingSystem
+import org.gradle.kotlin.dsl.support.serviceOf
+import java.io.IOException
+import java.util.Locale
+
+Locale.setDefault(Locale.US)
+
+plugins {
+  `maven-publish`
+  id("java")
+  id("idea")
+  id("jacoco")
+  alias(libs.plugins.gradle.extensions)
+  alias(libs.plugins.node) apply false
+
+  // Spotless version < 6.19.0 (https://github.com/diffplug/spotless/issues/1819) has an issue running against JDK21.
+  if (JavaVersion.current() == JavaVersion.VERSION_17) {
+    alias(libs.plugins.spotless)
+  } else {
+    throw GradleException(
+      "The Gravitino Gradle toolchain currently does not support " +
+        "Java version ${JavaVersion.current()}. Please use JDK version 17."
+    )
+  }
+
+  alias(libs.plugins.publish)
+  // Apply one top level rat plugin to perform any required license enforcement analysis
+  alias(libs.plugins.rat)
+  alias(libs.plugins.bom)
+  alias(libs.plugins.dependencyLicenseReport)
+  alias(libs.plugins.tasktree)
+  alias(libs.plugins.errorprone)
+}
+
+val scalaVersion: String = project.properties["scalaVersion"] as? String ?: extra["defaultScalaVersion"].toString()
+if (scalaVersion !in listOf("2.12", "2.13")) {
+  throw GradleException("Scala version $scalaVersion is not supported.")
+}
+
+project.extra["extraJvmArgs"] =
+  listOf(
+    "-XX:+IgnoreUnrecognizedVMOptions",
+    "--add-opens", "java.base/java.io=ALL-UNNAMED",
+    "--add-opens", "java.base/java.lang=ALL-UNNAMED",
+    "--add-opens", "java.base/java.lang.invoke=ALL-UNNAMED",
+    "--add-opens", "java.base/java.lang.reflect=ALL-UNNAMED",
+    "--add-opens", "java.base/java.math=ALL-UNNAMED",
+    "--add-opens", "java.base/java.net=ALL-UNNAMED",
+    "--add-opens", "java.base/java.nio=ALL-UNNAMED",
+    "--add-opens", "java.base/java.text=ALL-UNNAMED",
+    "--add-opens", "java.base/java.time=ALL-UNNAMED",
+    "--add-opens", "java.base/java.util.concurrent.atomic=ALL-UNNAMED",
+    "--add-opens", "java.base/java.util.concurrent=ALL-UNNAMED",
+    "--add-opens", "java.base/java.util=ALL-UNNAMED",
+    "--add-opens", "java.base/java.util.regex=ALL-UNNAMED",
+    "--add-opens", "java.base/jdk.internal.ref=ALL-UNNAMED",
+    "--add-opens", "java.base/jdk.internal.reflect=ALL-UNNAMED",
+    "--add-opens", "java.sql/java.sql=ALL-UNNAMED",
+    "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
+    "--add-opens", "java.base/sun.nio.cs=ALL-UNNAMED",
+    "--add-opens", "java.base/sun.security.action=ALL-UNNAMED",
+    "--add-opens", "java.base/sun.util.calendar=ALL-UNNAMED",
+    "--add-opens", "java.security.jgss/sun.security.krb5=ALL-UNNAMED"
+  )
+
+val pythonVersion: String = project.properties["pythonVersion"] as? String ?: project.extra["pythonVersion"].toString()
+project.extra["pythonVersion"] = pythonVersion
+
+licenseReport {
+  renderers = arrayOf<ReportRenderer>(InventoryHtmlReportRenderer("report.html", "Backend"))
+  filters = arrayOf<DependencyFilter>(LicenseBundleNormalizer())
+}
+repositories { mavenCentral() }
+
+allprojects {
+  // Gravitino Python client project didn't need to apply the Spotless plugin
+  if (project.name == "client-python") {
+    return@allprojects
+  }
+
+  apply(plugin = "com.diffplug.spotless")
+  repositories {
+    mavenCentral()
+    mavenLocal()
+  }
+
+  plugins.withType<com.diffplug.gradle.spotless.SpotlessPlugin>().configureEach {
+    configure<com.diffplug.gradle.spotless.SpotlessExtension> {
+      java {
+        // 1.15.0 supports both JDK8 and JDK17.
+        googleJavaFormat("1.15.0")
+        removeUnusedImports()
+        trimTrailingWhitespace()
+        replaceRegex(
+          "Remove wildcard imports",
+          "import\\s+[^\\*\\s]+\\*;(\\r\\n|\\r|\\n)",
+          "$1"
+        )
+        replaceRegex(
+          "Remove static wildcard imports",
+          "import\\s+(?:static\\s+)?[^*\\s]+\\*;(\\r\\n|\\r|\\n)",
+          "$1"
+        )
+        replaceRegex(
+          "Use Guava classes from collect/base packages instead of any shadowed versions (including Jersey)",
+          "import\\s+(?:.*\\.com\\.google\\.common\\.(collect|base)|org\\.glassfish\\.jersey\\.internal\\.guava)\\.([A-Z][a-zA-Z0-9_]*);",
+          "import com.google.common.${'$'}1.${'$'}2;"
+        )
+        replaceRegex(
+          "Use Guava classes from all other packages instead of any shadowed versions",
+          "import\\s+.*\\.com\\.google\\.common\\.(io|util\\.concurrent|annotations|cache|primitives|hash|net|reflect)\\.([A-Z][a-zA-Z0-9_]*);",
+          "import com.google.common.${'$'}1.${'$'}2;"
+        )
+        replaceRegex(
+          "Use Apache Commons Lang3 instead of shadowed versions",
+          "import\\s+.*\\.org\\.apache\\.commons\\.lang3\\.([A-Z][a-zA-Z0-9_]*);",
+          "import org.apache.commons.lang3.${'$'}1;"
+        )
+        replaceRegex(
+          "Use Apache Commons IO instead of shadowed versions",
+          "import\\s+.*\\.org\\.apache\\.commons\\.io\\.([A-Z][a-zA-Z0-9_]*);",
+          "import org.apache.commons.io.${'$'}1;"
+        )
+        replaceRegex(
+          "Use SLF4J Logger instead of other logging frameworks",
+          "import\\s+.*\\.(Logger|LoggerFactory);",
+          "import org.slf4j.${'$'}1;"
+        )
+        replaceRegex(
+          "Remove Testcontainers shading",
+          "import\\s+org\\.testcontainers\\.shaded\\.([^;]+);",
+          "import $1;"
+        )
+
+        targetExclude("**/build/**", "**/.pnpm/***")
+      }
+
+      kotlinGradle {
+        target("*.gradle.kts")
+        ktlint().editorConfigOverride(mapOf("indent_size" to 2))
+      }
+    }
+  }
+
+  val setTestEnvironment: (Test) -> Unit = { param ->
+    param.doFirst {
+      param.jvmArgs(project.property("extraJvmArgs") as List<*>)
+
+      // Default use MiniGravitino to run integration tests
+      param.environment("GRAVITINO_ROOT_DIR", project.rootDir.path)
+      param.environment("IT_PROJECT_DIR", project.buildDir.path)
+      // If the environment variable `HADOOP_USER_NAME` is not customized in submodule,
+      // then set it to "anonymous"
+      if (param.environment["HADOOP_USER_NAME"] == null) {
+        param.environment("HADOOP_USER_NAME", "anonymous")
+      }
+      param.environment("HADOOP_HOME", "/tmp")
+      param.environment("PROJECT_VERSION", project.version)
+
+      // Gravitino CI Docker image
+      param.environment("GRAVITINO_CI_HIVE_DOCKER_IMAGE", "apache/gravitino-ci:hive-0.1.20")
+      param.environment("GRAVITINO_CI_KERBEROS_HIVE_DOCKER_IMAGE", "apache/gravitino-ci:kerberos-hive-0.1.6")
+      param.environment("GRAVITINO_CI_DORIS_DOCKER_IMAGE", "apache/gravitino-ci:doris-0.1.5")
+      param.environment("GRAVITINO_CI_TRINO_DOCKER_IMAGE", "apache/gravitino-ci:trino-0.1.6")
+      param.environment("GRAVITINO_CI_RANGER_DOCKER_IMAGE", "apache/gravitino-ci:ranger-0.1.2")
+      param.environment("GRAVITINO_CI_KAFKA_DOCKER_IMAGE", "apache/kafka:3.7.0")
+      param.environment("GRAVITINO_CI_LOCALSTACK_DOCKER_IMAGE", "localstack/localstack:latest")
+
+      // Disable Ryuk for integration tests
+      // Ryuk need privileged mode, if we want to rootless or run non-privileged mode, we need to disable it.
+      param.environment("TESTCONTAINERS_RYUK_DISABLED", "true")
+
+      val dockerRunning = project.rootProject.extra["dockerRunning"] as? Boolean ?: false
+      val macDockerConnector = project.rootProject.extra["macDockerConnector"] as? Boolean ?: false
+      if (OperatingSystem.current().isMacOsX() &&
+        dockerRunning &&
+        macDockerConnector
+      ) {
+        param.environment("NEED_CREATE_DOCKER_NETWORK", "true")
+      }
+
+      val icebergVersion: String = libs.versions.iceberg.get()
+      param.systemProperty("ICEBERG_VERSION", icebergVersion)
+
+      // Change poll image pause time from 30s to 60s
+      param.environment("TESTCONTAINERS_PULL_PAUSE_TIMEOUT", "60")
+      val jdbcDatabase = project.properties["jdbcBackend"] as? String ?: "h2"
+      param.environment("jdbcBackend", jdbcDatabase)
+
+      val testMode = project.properties["testMode"] as? String ?: "embedded"
+      param.systemProperty("gravitino.log.path", "build/${project.name}-integration-test.log")
+      project.delete("build/${project.name}-integration-test.log")
+      if (testMode == "deploy") {
+        param.environment("GRAVITINO_HOME", project.rootDir.path + "/distribution/package-all")
+        val useWebV2 = System.getenv("GRAVITINO_USE_WEB_V2")?.toBoolean() == true
+        val webWarPath = if (useWebV2) {
+          project.rootDir.path + "/distribution/package/web-v2/gravitino-web-${project.version}.war"
+        } else {
+          project.rootDir.path + "/distribution/package/web/gravitino-web-${project.version}.war"
+        }
+        param.environment("GRAVITINO_WAR", webWarPath)
+        param.systemProperty("testMode", "deploy")
+      } else if (testMode == "embedded") {
+        param.environment("GRAVITINO_HOME", project.rootDir.path)
+        param.environment("GRAVITINO_TEST", "true")
+        val useWebV2 = System.getenv("GRAVITINO_USE_WEB_V2")?.toBoolean() == true
+        val webWarPath = if (useWebV2) {
+          project.rootDir.path + "/web-v2/web/dist/"
+        } else {
+          project.rootDir.path + "/web/web/dist/"
+        }
+        param.environment("GRAVITINO_WAR", webWarPath)
+        param.systemProperty("testMode", "embedded")
+      } else {
+        throw GradleException(
+          "Gravitino integration tests are only compatible with the modes " +
+            "[-PtestMode=embedded] or [-PtestMode=deploy]."
+        )
+      }
+      param.useJUnitPlatform()
+      val skipUTs = project.hasProperty("skipTests")
+      if (skipUTs) {
+        // Only run integration tests
+        param.include("**/integration/test/**")
+      }
+
+      val dockerTest = project.rootProject.extra["dockerTest"] as? Boolean ?: false
+      param.environment("dockerTest", dockerTest.toString())
+      param.useJUnitPlatform {
+        if (!dockerTest) {
+          excludeTags("gravitino-docker-test")
+        }
+      }
+    }
+  }
+
+  extra["initTestParam"] = setTestEnvironment
+}
+
+nexusPublishing {
+  repositories {
+    sonatype {
+      nexusUrl.set(uri("https://s01.oss.sonatype.org/service/local/"))
+      snapshotRepositoryUrl.set(uri("https://s01.oss.sonatype.org/content/repositories/snapshots/"))
+
+      val sonatypeUser =
+        System.getenv("SONATYPE_USER").takeUnless { it.isNullOrEmpty() }
+          ?: extra["SONATYPE_USER"].toString()
+      val sonatypePassword =
+        System.getenv("SONATYPE_PASSWORD").takeUnless { it.isNullOrEmpty() }
+          ?: extra["SONATYPE_PASSWORD"].toString()
+
+      username.set(sonatypeUser)
+      password.set(sonatypePassword)
+    }
+  }
+
+  packageGroup.set("org.apache.gravitino")
+}
+
+fun excludePackagesForSparkConnector(project: Project) {
+  project.afterEvaluate {
+    if (scalaVersion != "2.12") {
+      val excludedPackages = listOf(
+        "org/apache/gravitino/spark/connector/paimon/**",
+        "org/apache/gravitino/spark/connector/integration/test/paimon/**"
+      )
+
+      sourceSets {
+        main {
+          java {
+            exclude(excludedPackages)
+          }
+        }
+        test {
+          java {
+            exclude(excludedPackages)
+          }
+        }
+      }
+    }
+  }
+}
+
+subprojects {
+  // Gravitino Python client project didn't need to apply the java plugin
+  if (project.name == "client-python") {
+    return@subprojects
+  }
+
+  if (project.path == ":catalogs:hive-metastore2-libs" ||
+    project.path == ":catalogs:hive-metastore3-libs"
+  ) {
+    return@subprojects
+  }
+
+  apply(plugin = "jacoco")
+  apply(plugin = "maven-publish")
+  apply(plugin = "java")
+
+  repositories {
+    mavenCentral()
+    mavenLocal()
+  }
+
+  fun compatibleWithJDK8(project: Project): Boolean {
+    val name = project.name.lowercase()
+    val path = project.path.lowercase()
+    if (path.startsWith(":maintenance:jobs") ||
+      path.startsWith(":maintenance:optimizer-api") ||
+      path.startsWith(":maintenance:gravitino-updaters") ||
+      path.startsWith(":clients:client-java") ||
+      name == "api" ||
+      name == "common" ||
+      name == "catalog-common" ||
+      name == "hadoop-common"
+    ) {
+      return true
+    }
+
+    val isReleaseRun = gradle.startParameter.taskNames.any {
+      it == "release" || it == "publish" || it == "publishToMavenLocal" || it.endsWith(":release") || it.endsWith(
+        ":publish"
+      ) || it.endsWith(":publishToMavenLocal")
+    }
+    if (!isReleaseRun) {
+      return false
+    }
+
+    if (path.startsWith(":client") ||
+      path.startsWith(":spark-connector") ||
+      path.startsWith(":flink-connector") ||
+      path.startsWith(":bundles")
+    ) {
+      return true
+    }
+
+    return false
+  }
+  extensions.extraProperties.set("excludePackagesForSparkConnector", ::excludePackagesForSparkConnector)
+
+  tasks.register("printJvm") {
+    group = "help"
+    description = "print JVM information"
+
+    doLast {
+      val compileJvmVersion = tasks.withType<JavaCompile>().firstOrNull()?.javaCompiler?.get()
+        ?.metadata?.languageVersion?.asInt() ?: "undefined"
+
+      val testJvmVersion = tasks.withType<Test>().firstOrNull()?.javaLauncher?.get()
+        ?.metadata?.languageVersion?.asInt() ?: "undefined"
+
+      val testJvmArgs = tasks.withType<Test>().firstOrNull()?.jvmArgs ?: listOf()
+
+      val targetJvmVersion = (java.targetCompatibility?.majorVersion ?: "undefined")
+
+      val sourceJvmVersion = (java.sourceCompatibility?.majorVersion ?: "undefined")
+
+      println(
+        """
+              |=== ${project.name} JVM information===
+              | project path: ${project.path}
+              | JVM for compile: $compileJvmVersion
+              | JVM for test: $testJvmVersion
+              | JVM test args: $testJvmArgs
+              | target JVM version: $targetJvmVersion
+              | source JVM version: $sourceJvmVersion
+              |==================================
+        """.trimMargin()
+      )
+    }
+  }
+
+  java {
+    toolchain {
+      // Some JDK vendors like Homebrew installed OpenJDK 17 have problems in building trino-connector:
+      // It will cause tests of Trino-connector hanging forever on macOS, to avoid this issue and
+      // other vendor-related problems, Gravitino will use the specified AMAZON OpenJDK 17 to build
+      // Trino-connector on macOS.
+      if (project.name == "trino-connector") {
+        if (OperatingSystem.current().isMacOsX) {
+          vendor.set(JvmVendorSpec.AMAZON)
+        }
+        languageVersion.set(JavaLanguageVersion.of(17))
+      } else if (compatibleWithJDK8(project)) {
+        languageVersion.set(JavaLanguageVersion.of(17))
+        sourceCompatibility = JavaVersion.VERSION_1_8
+        targetCompatibility = JavaVersion.VERSION_1_8
+      } else {
+        languageVersion.set(JavaLanguageVersion.of(17))
+      }
+    }
+  }
+
+  gradle.projectsEvaluated {
+    tasks.withType<JavaCompile> {
+      options.compilerArgs.addAll(
+        arrayOf(
+          "-Xlint:cast",
+          "-Xlint:deprecation",
+          "-Xlint:divzero",
+          "-Xlint:empty",
+          "-Xlint:fallthrough",
+          "-Xlint:finally",
+          "-Xlint:overrides",
+          "-Xlint:static",
+          "-Werror"
+        )
+      )
+    }
+  }
+
+  apply(plugin = "net.ltgt.errorprone")
+  dependencies {
+    errorprone("com.google.errorprone:error_prone_core:2.10.0")
+  }
+
+  tasks.withType<JavaCompile>().configureEach {
+    options.errorprone.isEnabled.set(true)
+    options.errorprone.disableWarningsInGeneratedCode.set(true)
+    options.errorprone.disable(
+      "AlmostJavadoc",
+      "CanonicalDuration",
+      "CheckReturnValue",
+      "ComparableType",
+      "ConstantOverflow",
+      "DoubleBraceInitialization",
+      "EqualsUnsafeCast",
+      "EmptyBlockTag",
+      "FutureReturnValueIgnored",
+      "InconsistentCapitalization",
+      "InconsistentHashCode",
+      "JavaTimeDefaultTimeZone",
+      "JdkObsolete",
+      "LockNotBeforeTry",
+      "MissingOverride",
+      "MissingSummary",
+      "MutableConstantField",
+      "NonOverridingEquals",
+      "ObjectEqualsForPrimitives",
+      "OperatorPrecedence",
+      "ReturnValueIgnored",
+      "SameNameButDifferent",
+      "StaticAssignmentInConstructor",
+      "StringSplitter",
+      "ThreadPriorityCheck",
+      "ThrowIfUncheckedKnownChecked",
+      "TypeParameterUnusedInFormals",
+      "UnicodeEscape",
+      "UnnecessaryParentheses",
+      "UnsafeReflectiveConstructionCast",
+      "UnusedMethod",
+      "VariableNameSameAsType",
+      "WaitNotInLoop"
+    )
+  }
+
+  tasks.withType<Javadoc> {
+    options.encoding = "UTF-8"
+    options.locale = "en_US"
+
+    val projectName = project.name
+    if (projectName == "api" ||
+      projectName == "client-java" ||
+      projectName == "client-cli" ||
+      projectName == "common" ||
+      projectName == "filesystem-hadoop3"
+    ) {
+      options {
+        (this as CoreJavadocOptions).addStringOption("Xwerror", "-quiet")
+        isFailOnError = true
+      }
+    }
+  }
+
+  val sourcesJar by tasks.registering(Jar::class) {
+    from(sourceSets.named("main").get().allSource)
+    archiveClassifier.set("sources")
+  }
+
+  val javadocJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("javadoc")
+    from(tasks["javadoc"])
+  }
+
+  tasks.withType<Jar> {
+    into("META-INF") {
+      from(rootDir) {
+        if (name == "sourcesJar") {
+          include("LICENSE")
+          include("NOTICE")
+        } else if (project.name == "web") {
+          include("web/web/LICENSE.bin")
+          rename("LICENSE.bin", "LICENSE")
+          include("web/web/NOTICE.bin")
+          rename("NOTICE.bin", "NOTICE")
+        } else {
+          include("LICENSE.bin")
+          rename("LICENSE.bin", "LICENSE")
+          include("NOTICE.bin")
+          rename("NOTICE.bin", "NOTICE")
+        }
+      }
+    }
+  }
+
+  if (project.name in listOf("web", "web-v2", "docs")) {
+    plugins.apply(NodePlugin::class)
+    configure<NodeExtension> {
+      version.set("20.19.0")
+      pnpmVersion.set("9.x")
+      nodeProjectDir.set(file("$rootDir/.node"))
+      download.set(true)
+    }
+  }
+
+  apply(plugin = "signing")
+  publishing {
+    publications {
+      create<MavenPublication>("MavenJava") {
+        if (project.name == "docs" ||
+          project.name == "integration-test" ||
+          project.name == "integration-test-common" ||
+          project.name == "web"
+        ) {
+          setArtifacts(emptyList<Any>())
+        } else {
+          from(components["java"])
+          artifact(sourcesJar)
+          artifact(javadocJar)
+        }
+
+        artifactId = "${rootProject.name.lowercase()}-${project.name}"
+
+        pom {
+          name.set("Gravitino")
+          description.set("Gravitino is a high-performance, geo-distributed and federated metadata lake.")
+          url.set("https://gravitino.apache.org")
+          licenses {
+            license {
+              name.set("The Apache Software License, Version 2.0")
+              url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+            }
+          }
+          developers {
+            developer {
+              id.set("The Gravitino community")
+              name.set("support")
+              email.set("dev@gravitino.apache.org")
+            }
+          }
+          scm {
+            url.set("https://github.com/apache/gravitino")
+            connection.set("scm:git:git://github.com/apache/gravitino.git")
+          }
+        }
+      }
+    }
+  }
+
+  configure<SigningExtension> {
+    val taskNames = gradle.getStartParameter().getTaskNames()
+    taskNames.forEach() {
+      if (it.contains("publishToMavenLocal")) setRequired(false)
+    }
+
+    val gpgId = System.getenv("GPG_ID")
+    val gpgSecretKey = System.getenv("GPG_PRIVATE_KEY")
+    val gpgKeyPassword = System.getenv("GPG_PASSPHRASE")
+    useInMemoryPgpKeys(gpgId, gpgSecretKey, gpgKeyPassword)
+    sign(publishing.publications)
+  }
+
+  tasks.configureEach<Test> {
+    if (project.name != "server-common") {
+      val initTest = project.extra.get("initTestParam") as (Test) -> Unit
+      initTest(this)
+    }
+
+    val testTaskStartTimeMsKey = "testTaskStartTimeMs"
+    doFirst {
+      extensions.extraProperties[testTaskStartTimeMsKey] = System.currentTimeMillis()
+      logger.lifecycle(
+        "[TEST-TIMING] START module={} task={} at={}",
+        project.path,
+        path,
+        extensions.extraProperties[testTaskStartTimeMsKey]
+      )
+    }
+
+    doLast {
+      val endTimeMs = System.currentTimeMillis()
+      val startTimeMs = extensions.extraProperties[testTaskStartTimeMsKey] as? Long ?: endTimeMs
+      logger.lifecycle(
+        "[TEST-TIMING] END module={} task={} startMs={} endMs={} durationMs={}",
+        project.path,
+        path,
+        startTimeMs,
+        endTimeMs,
+        endTimeMs - startTimeMs
+      )
+    }
+
+    testLogging {
+      exceptionFormat = TestExceptionFormat.FULL
+      showExceptions = true
+      showCauses = true
+      showStackTraces = true
+    }
+    reports.html.outputLocation.set(file("${rootProject.projectDir}/build/reports/"))
+    val skipTests = project.hasProperty("skipTests")
+    if (!skipTests) {
+      val extraArgs = project.property("extraJvmArgs") as List<String>
+      jvmArgs = listOf("-Xmx4G") + extraArgs
+      useJUnitPlatform()
+      finalizedBy(tasks.getByName("jacocoTestReport"))
+    }
+  }
+
+  tasks.withType<JacocoReport> {
+    reports {
+      csv.required.set(true)
+      xml.required.set(true)
+      html.required.set(true)
+    }
+  }
+
+  tasks.register("allDeps", DependencyReportTask::class)
+
+  group = "org.apache.gravitino"
+  version = "$version"
+
+  tasks.withType<Jar> {
+    archiveBaseName.set("${rootProject.name.lowercase()}-${project.name}")
+    if (project.name == "server") {
+      from(sourceSets.main.get().resources)
+      setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
+    }
+
+    if (project.name != "integration-test") {
+      exclude("log4j2.properties")
+      exclude("test/**")
+    }
+  }
+  tasks.named("compileJava").configure {
+    dependsOn("spotlessCheck")
+  }
+}
+
+tasks.rat {
+  approvedLicense("Apache License Version 2.0")
+
+  // Set input directory to that of the root project instead of the CWD. This
+  // makes .gitignore rules (added below) work properly.
+  inputDir.set(project.rootDir)
+
+  val exclusions = mutableListOf(
+    // Ignore files we track but do not need full headers
+    "**/.github/**/*",
+    "**/*.log",
+    "**/*.out",
+    "**/*.venv",
+    "**/*.egg-info",
+    "**/.pytest_cache",
+    "**/.python-version",
+    "**/.uv",
+    "**/__pycache__",
+    "**/uv.lock",
+    "**/licenses/*.txt",
+    "**/licenses/*.md",
+    "**/LICENSE.*",
+    "**/NOTICE.*",
+    "**/trino-ci-testset",
+    "ROADMAP.md",
+    "GETTING_STARTED.md",
+    "clients/cli/src/main/resources/*.txt",
+    "clients/client-python/venv/*",
+    "clients/client-python/docs/build",
+    "clients/client-python/docs/source/generated",
+    "clients/client-python/gravitino/utils/http_client.py",
+    "clients/client-python/tests/unittests/htmlcov/*",
+    "clients/client-python/tests/integration/htmlcov/*",
+    "clients/filesystem-fuse/Cargo.lock",
+    "dev/docker/**/*.xml",
+    "dev/docker/**/*.conf",
+    "dev/docker/kerberos-hive/kadm5.acl",
+    "docs/**/*.md",
+    "gradle/wrapper/gradle-wrapper.properties",
+    "lineage/src/test/java/org/apache/gravitino/lineage/source/TestLineageOperations.java",
+    "spark-connector/spark-common/src/test/resources/**",
+    "web/web/.**",
+    "web/web/dist/**/*",
+    "web/web/next-env.d.ts",
+    "web/web/node_modules/**/*",
+    "web/web/package-lock.json",
+    "web/web/pnpm-lock.yaml",
+    "web/web/src/lib/enums/httpEnum.js",
+    "web/web/src/lib/icons/svg/**/*.svg",
+    "web/web/src/lib/utils/axios/**/*",
+    "web/web/src/types/axios.d.ts",
+    "web/web/yarn.lock",
+    "web-v2/web/.**",
+    "web-v2/web/dist/**/*",
+    "web-v2/web/next-env.d.ts",
+    "web-v2/web/node_modules/**/*",
+    "web-v2/web/package-lock.json",
+    "web-v2/web/pnpm-lock.yaml",
+    "web-v2/web/src/lib/enums/httpEnum.js",
+    "web-v2/web/src/lib/icons/svg/**/*.svg",
+    "web-v2/web/src/lib/utils/axios/**/*",
+    "web-v2/web/src/types/axios.d.ts",
+    "web-v2/web/yarn.lock"
+  )
+
+  // Add .gitignore excludes to the Apache Rat exclusion list.
+  val gitIgnore = project(":").file(".gitignore")
+  if (gitIgnore.exists()) {
+    val gitIgnoreExcludes = gitIgnore.readLines().filter {
+      it.isNotEmpty() && !it.startsWith("#")
+    }
+    exclusions.addAll(gitIgnoreExcludes)
+  }
+
+  verbose.set(true)
+  failOnError.set(true)
+  setExcludes(exclusions)
+}
+
+tasks.check.get().dependsOn(tasks.rat)
+
+tasks.cyclonedxBom {
+  setIncludeConfigs(listOf("runtimeClasspath"))
+}
+
+jacoco {
+  toolVersion = "0.8.10"
+  reportsDirectory.set(layout.buildDirectory.dir("JacocoReport"))
+}
+
+tasks {
+  val projectDir = layout.projectDirectory
+  val outputDir = projectDir.dir("distribution")
+
+  val compileDistribution by registering {
+    dependsOn(
+      "copyCatalogLibAndConfigs",
+      "copySubprojectDependencies",
+      "copySubprojectLib",
+      "copyCliLib",
+      "copyJobsLib",
+      ":authorizations:copyLibAndConfig",
+      ":iceberg:iceberg-rest-server:copyLibAndConfigs",
+      ":lance:lance-rest-server:copyLibAndConfigs",
+      ":maintenance:optimizer:copyLibAndConfigs",
+      ":web:web:build",
+      ":web-v2:web:build"
+    )
+
+    group = "gravitino distribution"
+    outputs.dir(projectDir.dir("distribution/package"))
+    doLast {
+      copy {
+        from(projectDir.dir("conf")) { into("package/conf") }
+        from(projectDir.dir("bin")) { into("package/bin") }
+        from(projectDir.dir("web/web/build/libs/${rootProject.name}-web-$version.war")) { into("package/web") }
+        from(projectDir.dir("web-v2/web/build/libs/${rootProject.name}-web-$version.war")) { into("package/web-v2") }
+        from(projectDir.dir("scripts")) { into("package/scripts") }
+        into(outputDir)
+        rename { fileName ->
+          fileName.replace(".template", "")
+        }
+        eachFile {
+          if (name == "gravitino-env.sh") {
+            filter { line ->
+              line.replace("GRAVITINO_VERSION_PLACEHOLDER", "$version")
+            }
+          }
+        }
+        fileMode = 0b111101101
+      }
+      copy {
+        from(projectDir.dir("licenses")) { into("package/licenses") }
+        from(projectDir.file("LICENSE.bin")) { into("package") }
+        from(projectDir.file("NOTICE.bin")) { into("package") }
+        from(projectDir.file("README.md")) { into("package") }
+        from(projectDir.dir("web/web/licenses")) { into("package/web/licenses") }
+        from(projectDir.dir("web/web/LICENSE.bin")) { into("package/web") }
+        from(projectDir.dir("web/web/NOTICE.bin")) { into("package/web") }
+        from(projectDir.dir("web-v2/web/licenses")) { into("package/web-v2/licenses") }
+        from(projectDir.dir("web-v2/web/LICENSE.bin")) { into("package/web-v2") }
+        from(projectDir.dir("web-v2/web/NOTICE.bin")) { into("package/web-v2") }
+        into(outputDir)
+        rename { fileName ->
+          fileName.replace(".bin", "")
+        }
+      }
+
+      // Create the directory 'data' for storage.
+      val directory = File("distribution/package/data")
+      directory.mkdirs()
+
+      // Copy the all directory distribution/package to distribution/package-all
+      copy {
+        from(projectDir.dir("distribution/package"))
+        into(projectDir.dir("distribution/package-all"))
+      }
+
+      // remove catalogs-contrib modules from distribution/package
+      project.file("catalogs-contrib").listFiles()?.forEach { file ->
+        if (file.isDirectory) {
+          val catalogName = file.name.replace("catalog-", "")
+          delete(projectDir.dir("distribution/package/catalogs/$catalogName"))
+        }
+      }
+    }
+  }
+
+  val compileIcebergRESTServer by registering {
+    dependsOn("iceberg:iceberg-rest-server:copyLibAndConfigsToStandalonePackage")
+    group = "gravitino distribution"
+    outputs.dir(projectDir.dir("distribution/${rootProject.name}-iceberg-rest-server"))
+    doLast {
+      copy {
+        from(projectDir.dir("conf")) {
+          include(
+            "${rootProject.name}-iceberg-rest-server.conf.template",
+            "${rootProject.name}-env.sh.template",
+            "log4j2.properties.template"
+          )
+          into("${rootProject.name}-iceberg-rest-server/conf")
+        }
+        from(projectDir.dir("bin")) {
+          include("common.sh.template", "${rootProject.name}-iceberg-rest-server.sh.template")
+          into("${rootProject.name}-iceberg-rest-server/bin")
+        }
+        into(outputDir)
+        rename { fileName ->
+          fileName.replace(".template", "")
+        }
+        eachFile {
+          if (name == "gravitino-env.sh") {
+            filter { line ->
+              line.replace("GRAVITINO_VERSION_PLACEHOLDER", "$version")
+            }
+          }
+        }
+        fileMode = 0b111101101
+      }
+
+      copy {
+        from(projectDir.dir("licenses")) { into("${rootProject.name}-iceberg-rest-server/licenses") }
+        from(projectDir.file("LICENSE.iceberg")) { into("${rootProject.name}-iceberg-rest-server") }
+        from(projectDir.file("NOTICE.iceberg")) { into("${rootProject.name}-iceberg-rest-server") }
+        from(projectDir.file("README.md")) { into("${rootProject.name}-iceberg-rest-server") }
+        into(outputDir)
+        rename { fileName ->
+          fileName.replace(".iceberg", "")
+        }
+      }
+    }
+  }
+
+  val compileLanceRESTServer by registering {
+    dependsOn("lance:lance-rest-server:copyLibAndConfigsToStandalonePackage")
+    group = "gravitino distribution"
+    outputs.dir(projectDir.dir("distribution/${rootProject.name}-lance-rest-server"))
+    doLast {
+      copy {
+        from(projectDir.dir("conf")) {
+          include(
+            "${rootProject.name}-lance-rest-server.conf.template",
+            "${rootProject.name}-env.sh.template",
+            "log4j2.properties.template"
+          )
+          into("${rootProject.name}-lance-rest-server/conf")
+        }
+        from(projectDir.dir("bin")) {
+          include("common.sh.template", "${rootProject.name}-lance-rest-server.sh.template")
+          into("${rootProject.name}-lance-rest-server/bin")
+        }
+        into(outputDir)
+        rename { fileName ->
+          fileName.replace(".template", "")
+        }
+        eachFile {
+          if (name == "gravitino-env.sh") {
+            filter { line ->
+              line.replace("GRAVITINO_VERSION_PLACEHOLDER", "$version")
+            }
+          }
+        }
+        fileMode = 0b111101101
+      }
+
+      copy {
+        from(projectDir.dir("licenses")) { into("${rootProject.name}-lance-rest-server/licenses") }
+        from(projectDir.file("LICENSE.lance")) { into("${rootProject.name}-lance-rest-server") }
+        from(projectDir.file("NOTICE.lance")) { into("${rootProject.name}-lance-rest-server") }
+        from(projectDir.file("README.md")) { into("${rootProject.name}-lance-rest-server") }
+        into(outputDir)
+        rename { fileName ->
+          fileName.replace(".lance", "")
+        }
+      }
+    }
+  }
+
+  val compileTrinoConnector by registering {
+    dependsOn("trino-connector:trino-connector-473-478:copyLibs")
+    group = "gravitino distribution"
+  }
+
+  val assembleDistribution by registering(Tar::class) {
+    dependsOn(
+      ":trino-connector:trino-connector-435-439:assembleTrinoConnector",
+      ":trino-connector:trino-connector-440-445:assembleTrinoConnector",
+      ":trino-connector:trino-connector-446-451:assembleTrinoConnector",
+      ":trino-connector:trino-connector-452-468:assembleTrinoConnector",
+      ":trino-connector:trino-connector-469-472:assembleTrinoConnector",
+      ":trino-connector:trino-connector-473-478:assembleTrinoConnector",
+      "assembleIcebergRESTServer",
+      "assembleLanceRESTServer"
+    )
+    group = "gravitino distribution"
+    finalizedBy("checksumDistribution")
+    into("${rootProject.name}-$version-bin")
+    from(compileDistribution.map { it.outputs.files.single() })
+    compression = Compression.GZIP
+    archiveFileName.set("${rootProject.name}-$version-bin.tar.gz")
+    destinationDirectory.set(projectDir.dir("distribution"))
+  }
+
+  val assembleDistributionAll by registering(Tar::class) {
+    dependsOn(compileDistribution)
+    group = "gravitino distribution"
+    finalizedBy("checksumDistributionAll")
+    into("${rootProject.name}-$version-bin-all")
+    from(projectDir.dir("distribution/package-all"))
+    compression = Compression.GZIP
+    archiveFileName.set("${rootProject.name}-$version-bin-all.tar.gz")
+    destinationDirectory.set(projectDir.dir("distribution"))
+  }
+
+  register("checksumDistributionAll") {
+    group = "gravitino distribution"
+    dependsOn(assembleDistributionAll)
+    val archiveFile = assembleDistributionAll.flatMap { it.archiveFile }
+    val checksumFile = archiveFile.map { archive ->
+      archive.asFile.let { it.resolveSibling("${it.name}.sha256") }
+    }
+    inputs.file(archiveFile)
+    outputs.file(checksumFile)
+    doLast {
+      checksumFile.get().writeText(
+        serviceOf<ChecksumService>().sha256(archiveFile.get().asFile).toString()
+      )
+    }
+  }
+
+  val assembleLanceRESTServer by registering(Tar::class) {
+    dependsOn("compileLanceRESTServer")
+    group = "gravitino distribution"
+    finalizedBy("checksumLanceRESTServerDistribution")
+    into("${rootProject.name}-lance-rest-server-$version-bin")
+    from(compileLanceRESTServer.map { it.outputs.files.single() })
+    compression = Compression.GZIP
+    archiveFileName.set("${rootProject.name}-lance-rest-server-$version-bin.tar.gz")
+    destinationDirectory.set(projectDir.dir("distribution"))
+  }
+
+  val assembleIcebergRESTServer by registering(Tar::class) {
+    dependsOn("compileIcebergRESTServer")
+    group = "gravitino distribution"
+    finalizedBy("checksumIcebergRESTServerDistribution")
+    into("${rootProject.name}-iceberg-rest-server-$version-bin")
+    from(compileIcebergRESTServer.map { it.outputs.files.single() })
+    compression = Compression.GZIP
+    archiveFileName.set("${rootProject.name}-iceberg-rest-server-$version-bin.tar.gz")
+    destinationDirectory.set(projectDir.dir("distribution"))
+  }
+
+  register("checksumIcebergRESTServerDistribution") {
+    group = "gravitino distribution"
+    dependsOn(assembleIcebergRESTServer)
+    val archiveFile = assembleIcebergRESTServer.flatMap { it.archiveFile }
+    val checksumFile = archiveFile.map { archive ->
+      archive.asFile.let { it.resolveSibling("${it.name}.sha256") }
+    }
+    inputs.file(archiveFile)
+    outputs.file(checksumFile)
+    doLast {
+      checksumFile.get().writeText(
+        serviceOf<ChecksumService>().sha256(archiveFile.get().asFile).toString()
+      )
+    }
+  }
+
+  register("checksumLanceRESTServerDistribution") {
+    group = "gravitino distribution"
+    dependsOn(assembleLanceRESTServer)
+    val archiveFile = assembleLanceRESTServer.flatMap { it.archiveFile }
+    val checksumFile = archiveFile.map { archive ->
+      archive.asFile.let { it.resolveSibling("${it.name}.sha256") }
+    }
+    inputs.file(archiveFile)
+    outputs.file(checksumFile)
+    doLast {
+      checksumFile.get().writeText(
+        serviceOf<ChecksumService>().sha256(archiveFile.get().asFile).toString()
+      )
+    }
+  }
+
+  register("checksumDistribution") {
+    group = "gravitino distribution"
+    dependsOn(assembleDistribution, "checksumIcebergRESTServerDistribution", "checksumLanceRESTServerDistribution")
+    val archiveFile = assembleDistribution.flatMap { it.archiveFile }
+    val checksumFile = archiveFile.map { archive ->
+      archive.asFile.let { it.resolveSibling("${it.name}.sha256") }
+    }
+    inputs.file(archiveFile)
+    outputs.file(checksumFile)
+    doLast {
+      checksumFile.get().writeText(
+        serviceOf<ChecksumService>().sha256(archiveFile.get().asFile).toString()
+      )
+    }
+  }
+
+  val cleanDistribution by registering(Delete::class) {
+    group = "gravitino distribution"
+    delete(outputDir)
+  }
+
+  register("copySubprojectDependencies", Copy::class) {
+    subprojects.forEach() {
+      if (!it.name.startsWith("authorization") &&
+        !it.name.startsWith("catalog") &&
+        !it.name.startsWith("cli") &&
+        !it.name.startsWith("client") &&
+        !it.name.startsWith("filesystem") &&
+        !it.name.startsWith("flink") &&
+        !it.name.startsWith("iceberg") &&
+        !it.name.startsWith("lance") &&
+        !it.name.startsWith("optimizer") &&
+        !it.name.startsWith("spark") &&
+        !it.name.startsWith("hive-metastore") &&
+        !it.name.startsWith("trino-connector") &&
+        it.name != "hadoop-common" &&
+        it.name != "integration-test" &&
+        it.parent?.name != "bundles" &&
+        it.parent?.name != "maintenance" &&
+        it.name != "mcp-server"
+      ) {
+        from(it.configurations.runtimeClasspath)
+        into("distribution/package/libs")
+      }
+    }
+  }
+
+  register("copyCliLib", Copy::class) {
+    dependsOn("clients:cli:build")
+    from("clients/cli/build/libs")
+    into("distribution/package/auxlib")
+    include("gravitino-cli-*.jar")
+    setDuplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+  }
+
+  register("copyJobsLib", Copy::class) {
+    dependsOn(":maintenance:jobs:build")
+    from("maintenance/jobs/build/libs")
+    into("distribution/package/auxlib")
+    include("gravitino-jobs-*.jar")
+    exclude("*-empty.jar")
+    setDuplicatesStrategy(DuplicatesStrategy.EXCLUDE)
+  }
+
+  register("copySubprojectLib", Copy::class) {
+    subprojects.forEach() {
+      if (!it.name.startsWith("authorization") &&
+        !it.name.startsWith("catalog") &&
+        !it.name.startsWith("cli") &&
+        !it.name.startsWith("client") &&
+        !it.name.startsWith("filesystem") &&
+        !it.name.startsWith("flink") &&
+        !it.name.startsWith("iceberg") &&
+        !it.name.startsWith("lance") &&
+        !it.name.startsWith("integration-test") &&
+        !it.name.startsWith("spark") &&
+        !it.name.startsWith("trino-connector") &&
+        it.name != "hive-metastore2-libs" &&
+        it.name != "hive-metastore3-libs" &&
+        !it.name.startsWith("optimizer") &&
+        it.name != "hive-metastore-common" &&
+        it.name != "docs" &&
+        it.name != "hadoop-common" &&
+        it.name != "web" &&
+        it.name != "web-v2" &&
+        it.parent?.name != "bundles" &&
+        it.parent?.name != "maintenance" &&
+        it.name != "mcp-server"
+      ) {
+        dependsOn("${it.name}:build")
+        from("${it.name}/build/libs") {
+          include("*.jar")
+          exclude("*-jcstress.jar", "*-jmh.jar")
+        }
+        into("distribution/package/libs")
+        setDuplicatesStrategy(DuplicatesStrategy.INCLUDE)
+      }
+    }
+  }
+
+  register("copyCatalogLibAndConfigs", Copy::class) {
+    dependsOn(
+      ":catalogs:catalog-fileset:copyLibAndConfig",
+      ":catalogs:catalog-hive:copyLibAndConfig",
+      ":catalogs:catalog-jdbc-doris:copyLibAndConfig",
+      ":catalogs:catalog-jdbc-mysql:copyLibAndConfig",
+      ":catalogs:catalog-jdbc-postgresql:copyLibAndConfig",
+      ":catalogs:catalog-jdbc-starrocks:copyLibAndConfig",
+      ":catalogs:catalog-kafka:copyLibAndConfig",
+      ":catalogs:catalog-lakehouse-hudi:copyLibAndConfig",
+      ":catalogs:catalog-lakehouse-iceberg:copyLibAndConfig",
+      ":catalogs:catalog-lakehouse-paimon:copyLibAndConfig",
+      ":catalogs:catalog-model:copyLibAndConfig",
+      ":catalogs:hive-metastore2-libs:copyLibs",
+      ":catalogs:hive-metastore3-libs:copyLibs",
+      ":catalogs:catalog-lakehouse-generic:copyLibAndConfig",
+      ":catalogs-contrib:catalog-jdbc-hologres:copyLibAndConfig",
+      ":catalogs-contrib:catalog-jdbc-oceanbase:copyLibAndConfig",
+      ":catalogs-contrib:catalog-jdbc-clickhouse:copyLibAndConfig"
+    )
+  }
+
+  clean {
+    dependsOn(cleanDistribution)
+  }
+}
+
+apply(plugin = "com.dorongold.task-tree")
+
+project.extra["dockerTest"] = false
+project.extra["dockerRunning"] = false
+project.extra["macDockerConnector"] = false
+project.extra["isOrbStack"] = false
+
+// The following is to check the docker status and print the tip message
+fun printDockerCheckInfo() {
+  checkMacDockerConnector()
+  checkDockerStatus()
+  checkOrbStackStatus()
+
+  val testMode = project.properties["testMode"] as? String ?: "embedded"
+  if (testMode != "deploy" && testMode != "embedded") {
+    return
+  }
+  val dockerRunning = project.extra["dockerRunning"] as? Boolean ?: false
+  val macDockerConnector = project.extra["macDockerConnector"] as? Boolean ?: false
+  val isOrbStack = project.extra["isOrbStack"] as? Boolean ?: false
+  val skipDockerTests = if (extra["skipDockerTests"].toString().toBoolean()) {
+    // Read the environment variable (SKIP_DOCKER_TESTS) when skipDockerTests is true
+    // which means users can enable the docker tests by setting the gradle properties or the environment variable.
+    System.getenv("SKIP_DOCKER_TESTS")?.toBoolean() ?: true
+  } else {
+    false
+  }
+  if (skipDockerTests) {
+    project.extra["dockerTest"] = false
+  } else if (OperatingSystem.current().isMacOsX() &&
+    dockerRunning &&
+    (macDockerConnector || isOrbStack)
+  ) {
+    project.extra["dockerTest"] = true
+  } else if (OperatingSystem.current().isLinux() && dockerRunning) {
+    project.extra["dockerTest"] = true
+  }
+
+  println("------------------ Check Docker environment ---------------------")
+  println("Docker server status ............................................ [${if (dockerRunning) "running" else "\u001B[31mstop\u001B[0m"}]")
+  if (OperatingSystem.current().isMacOsX()) {
+    println("mac-docker-connector status ..................................... [${if (macDockerConnector) "running" else "\u001B[31mstop\u001B[0m"}]")
+    println("OrbStack status ................................................. [${if (dockerRunning && isOrbStack) "yes" else "\u001B[31mno\u001B[0m"}]")
+  }
+
+  val dockerTest = project.extra["dockerTest"] as? Boolean ?: false
+  if (dockerTest) {
+    println("Using Docker container to run all tests ......................... [$testMode test]")
+  } else {
+    println("Run test cases without `gravitino-docker-test` tag .............. [$testMode test]")
+  }
+  println("-----------------------------------------------------------------")
+
+  // Print help message if Docker server or mac-docker-connector is not running
+  printDockerServerTip()
+  printMacDockerTip()
+}
+
+fun printDockerServerTip() {
+  val dockerRunning = project.extra["dockerRunning"] as? Boolean ?: false
+  if (!dockerRunning) {
+    val redColor = "\u001B[31m"
+    val resetColor = "\u001B[0m"
+    println("Tip: Please make sure to start the ${redColor}Docker server$resetColor before running the integration tests.")
+  }
+}
+
+fun printMacDockerTip() {
+  val macDockerConnector = project.extra["macDockerConnector"] as? Boolean ?: false
+  val isOrbStack = project.extra["isOrbStack"] as? Boolean ?: false
+  if (OperatingSystem.current().isMacOsX() && !macDockerConnector && !isOrbStack) {
+    val redColor = "\u001B[31m"
+    val resetColor = "\u001B[0m"
+    println(
+      "Tip: Please make sure to use ${redColor}OrbStack$resetColor or execute the " +
+        "$redColor`dev/docker/tools/mac-docker-connector.sh`$resetColor script before running" +
+        " the integration test on macOS."
+    )
+  }
+}
+
+fun checkMacDockerConnector() {
+  if (!OperatingSystem.current().isMacOsX()) {
+    // Only macOS requires the use of `docker-connector`
+    return
+  }
+
+  try {
+    val processName = "docker-connector"
+    val command = "pgrep -x -q $processName"
+
+    val execResult = project.exec {
+      commandLine("bash", "-c", command)
+    }
+    if (execResult.exitValue == 0) {
+      project.extra["macDockerConnector"] = true
+    }
+  } catch (e: Exception) {
+    println("checkContainerRunning failed: ${e.message}")
+  }
+}
+
+fun checkDockerStatus() {
+  try {
+    val process = ProcessBuilder("docker", "info").start()
+    val exitCode = process.waitFor()
+
+    if (exitCode == 0) {
+      project.extra["dockerRunning"] = true
+    } else {
+      println("checkDockerStatus failed with exit code $exitCode")
+    }
+  } catch (e: IOException) {
+    println("checkDockerStatus failed: ${e.message}")
+  }
+}
+
+fun checkOrbStackStatus() {
+  if (!OperatingSystem.current().isMacOsX()) {
+    return
+  }
+
+  try {
+    val process = ProcessBuilder("docker", "context", "show").start()
+    val exitCode = process.waitFor()
+    if (exitCode == 0) {
+      val currentContext = process.inputStream.bufferedReader().readText()
+      println("Current docker context is: $currentContext")
+      project.extra["isOrbStack"] = currentContext.lowercase().contains("orbstack")
+    } else {
+      println("checkOrbStackStatus failed with exit code $exitCode")
+    }
+  } catch (e: IOException) {
+    println("checkOrbStackStatus failed: ${e.message}")
+  }
+}
+
+printDockerCheckInfo()
+
+tasks.register("release") {
+  group = "release"
+  description = "Builds and package a release version."
+  doFirst {
+    println("Releasing project...")
+  }
+
+  // Use 'assemble' instead of 'build' to skip tests during release
+  // Tests have JDK version conflicts (some need JDK 8, some need JDK 17)
+  // and should be run separately in CI/CD with appropriate JDK configurations
+  // Only include subprojects that apply the Java plugin (exclude client-python)
+  dependsOn(
+    subprojects
+      .filter { it.name != "client-python" }
+      .map { it.tasks.named("assemble") }
+  )
+}

@@ -1,0 +1,343 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+package org.apache.gravitino.server.authorization.expression;
+
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_CATALOG_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_FILESET_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_JOB_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_JOB_TEMPLATE_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_METALAKE_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_MODEL_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_POLICY_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_ROLE_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_SCHEMA_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_TABLE_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_TAG_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_TOPICS_AUTHORIZATION_EXPRESSION;
+import static org.apache.gravitino.server.authorization.expression.AuthorizationExpressionConstants.LOAD_VIEW_AUTHORIZATION_EXPRESSION;
+
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.apache.gravitino.auth.AuthConstants;
+import org.apache.gravitino.server.authorization.MetadataAuthzHelper;
+
+/**
+ * Convert the authorization expression into an executable expression, such as OGNL expression, etc.
+ */
+public class AuthorizationExpressionConverter {
+
+  /** Match authorization expressions */
+  public static final Pattern PATTERN = Pattern.compile("([A-Z_]+)::([A-Z_]+)");
+
+  /** Match ANY expressions */
+  public static final Pattern ANY_PATTERN = Pattern.compile("ANY\\(([^)]+)\\)");
+
+  /**
+   * This authorization expression will invoke the `hasMetadataPrivilegePermission` method of
+   * `GravitinoAuthorizer` to perform the access control check, and return the result of the
+   * authorization.
+   */
+  public static final String CAN_OPERATE_METADATA_PRIVILEGE = "CAN_OPERATE_METADATA_PRIVILEGE";
+
+  /**
+   * This authorization expression will invoke the `hasSetOwnerPermission` method of
+   * `GravitinoAuthorizer` to perform the access control check, and return the result of the
+   * authorization.
+   */
+  public static final String CAN_SET_OWNER = "CAN_SET_OWNER";
+
+  private static final String DENY_PREFIX = "DENY_";
+
+  /**
+   * The EXPRESSION_CACHE caches the result of converting authorization expressions into an OGNL
+   * expression.
+   */
+  private static final Map<String, String> EXPRESSION_CACHE = new ConcurrentHashMap<>();
+
+  private AuthorizationExpressionConverter() {}
+
+  /**
+   * Convert the authorization expression to OGNL expression. <a
+   * href="https://github.com/orphan-oss/ognl">OGNL</a> stands for Object-Graph Navigation Language;
+   * It is an expression language for getting and setting properties of Java objects, plus other
+   * extras such as list projection and selection and lambda expressions. You use the same
+   * expression for both getting and setting the value of a property.
+   *
+   * @param authorizationExpression authorization expression from {@link MetadataAuthzHelper}
+   * @return an OGNL expression used to call GravitinoAuthorizer
+   */
+  public static String convertToOgnlExpression(String authorizationExpression) {
+    return EXPRESSION_CACHE.computeIfAbsent(
+        authorizationExpression,
+        (expression) -> {
+          String replacedExpression = replaceCanAccessMetadataPrivilege(expression);
+          replacedExpression = replaceAnyPrivilege(replacedExpression);
+          replacedExpression = replaceAnyExpressions(replacedExpression);
+          Matcher matcher = PATTERN.matcher(replacedExpression);
+          StringBuffer result = new StringBuffer();
+
+          while (matcher.find()) {
+            String type = matcher.group(1);
+            String privilegeOrExpression = matcher.group(2);
+            String replacement;
+            if (AuthConstants.OWNER.equals(privilegeOrExpression)) {
+              replacement =
+                  String.format(
+                      "authorizer.isOwner(principal,METALAKE_NAME,%s,authorizationContext)", type);
+            } else if (privilegeOrExpression.startsWith(DENY_PREFIX)) {
+              String privilege = privilegeOrExpression.substring(5);
+              replacement =
+                  String.format(
+                      "authorizer.deny(principal,METALAKE_NAME,%s,"
+                          + "@org.apache.gravitino.authorization.Privilege\\$Name@%s,authorizationContext)",
+                      type, privilege);
+            } else if (AuthConstants.SELF.equals(privilegeOrExpression)) {
+              replacement =
+                  String.format(
+                      "authorizer.isSelf(@org.apache.gravitino.Entity\\$EntityType@%s,%s_NAME_IDENT)",
+                      type, type);
+            } else {
+              replacement =
+                  String.format(
+                      "authorizer.authorize(principal,METALAKE_NAME,%s,"
+                          + "@org.apache.gravitino.authorization.Privilege\\$Name@%s,authorizationContext)",
+                      type, privilegeOrExpression);
+            }
+
+            matcher.appendReplacement(result, replacement);
+          }
+          matcher.appendTail(result);
+
+          return result.toString();
+        });
+  }
+
+  /**
+   * Replaces any expression. For example, replace ANY(OWNER, METALAKE, CATALOG) to METALAKE::OWNER
+   * || CATALOG::OWNER.
+   *
+   * @param expression The original expression
+   * @return The modified expression
+   */
+  public static String replaceAnyExpressions(String expression) {
+    Matcher matcher = ANY_PATTERN.matcher(expression);
+    StringBuffer result = new StringBuffer();
+
+    while (matcher.find()) {
+      String innerContent = matcher.group(1);
+      String[] parts = innerContent.split(",");
+      if (parts.length < 2) {
+        matcher.appendReplacement(result, Matcher.quoteReplacement(matcher.group(0)));
+        continue;
+      }
+
+      String function = parts[0].trim();
+      StringBuilder replacement = new StringBuilder();
+      for (int i = 1; i < parts.length; i++) {
+        String scope = parts[i].trim();
+        if (!scope.isEmpty()) {
+          if (replacement.length() > 0) {
+            replacement.append(" || ");
+          }
+          replacement.append(scope).append("::").append(function);
+        }
+      }
+      matcher.appendReplacement(result, replacement.toString());
+    }
+    matcher.appendTail(result);
+    return result.toString();
+  }
+
+  public static String replaceCanAccessMetadataPrivilege(String expression) {
+    return expression.replaceAll(
+        AuthorizationExpressionConstants.CAN_ACCESS_METADATA,
+        """
+              ( entityType == 'CATALOG' && (%s)) ||
+              ( entityType == 'SCHEMA' && (%s)) ||
+              ( entityType == 'TABLE' && (%s)) ||
+              ( entityType == 'VIEW' && (%s)) ||
+              ( entityType == 'MODEL' && (%s)) ||
+              ( entityType == 'FILESET' && (%s)) ||
+              ( entityType == 'TOPIC' && (%s)) ||
+              ( entityType == 'ROLE' && (%s)) ||
+              ( entityType == 'METALAKE' && (%s)) ||
+              ( entityType == 'POLICY' && (%s)) ||
+              ( entityType == 'TAG' && (%s)) ||
+              ( entityType == 'JOB' && (%s)) ||
+              ( entityType == 'JOB_TEMPLATE' && (%s)) ||
+              ( entityType == 'COLUMN' && (%s))
+              """
+            .formatted(
+                LOAD_CATALOG_AUTHORIZATION_EXPRESSION,
+                LOAD_SCHEMA_AUTHORIZATION_EXPRESSION,
+                LOAD_TABLE_AUTHORIZATION_EXPRESSION,
+                LOAD_VIEW_AUTHORIZATION_EXPRESSION,
+                LOAD_MODEL_AUTHORIZATION_EXPRESSION,
+                LOAD_FILESET_AUTHORIZATION_EXPRESSION,
+                LOAD_TOPICS_AUTHORIZATION_EXPRESSION,
+                LOAD_ROLE_AUTHORIZATION_EXPRESSION,
+                LOAD_METALAKE_AUTHORIZATION_EXPRESSION,
+                LOAD_POLICY_AUTHORIZATION_EXPRESSION,
+                LOAD_TAG_AUTHORIZATION_EXPRESSION,
+                LOAD_JOB_AUTHORIZATION_EXPRESSION,
+                LOAD_JOB_TEMPLATE_AUTHORIZATION_EXPRESSION,
+                LOAD_TABLE_AUTHORIZATION_EXPRESSION));
+  }
+
+  /**
+   * Replace any privilege expression to any expression
+   *
+   * @param expression authorization expression
+   * @return authorization expression
+   */
+  public static String replaceAnyPrivilege(String expression) {
+    expression = expression.replaceAll("SERVICE_ADMIN", "authorizer.isServiceAdmin()");
+    expression = expression.replaceAll("METALAKE_USER", "authorizer.isMetalakeUser(METALAKE_NAME)");
+
+    // A single privilege (e.g., SELECT_TABLE) can be granted or denied at multiple namespace
+    // levels: metalake, catalog, schema, and table.
+    //
+    // Deny takes precedence over allow: if deny is set for the privilege at any level in the
+    // hierarchy,
+    // the user is not considered to have that privilege—even if an allow exists at a more specific
+    // level.
+    //
+    // Examples:
+    // - If role1 is allowed SELECT_TABLE on metalake1 but denied on catalog1,
+    //   then SELECT_TABLE is denied for all objects under catalog1.
+    // - If role1 is denied SELECT_TABLE on metalake1, any allow on catalog1 (or deeper) is
+    // overridden,
+    //   and SELECT_TABLE remains denied for catalog1 and its descendants.
+    expression =
+        expression.replaceAll(
+            "ANY_USE_CATALOG",
+            "((ANY(USE_CATALOG, METALAKE, CATALOG)) && "
+                + "!(ANY(DENY_USE_CATALOG, METALAKE, CATALOG)))");
+    expression =
+        expression.replaceAll(
+            "ANY_USE_SCHEMA",
+            "((ANY(USE_SCHEMA, METALAKE, CATALOG, SCHEMA)) "
+                + "&& !(ANY(DENY_USE_SCHEMA, METALAKE, CATALOG, SCHEMA)))");
+    expression =
+        expression.replaceAll(
+            "ANY_CREATE_SCHEMA",
+            "((ANY(CREATE_SCHEMA, METALAKE, CATALOG)) "
+                + "&& !(ANY(DENY_CREATE_SCHEMA, METALAKE, CATALOG)))");
+    expression =
+        expression.replaceAll(
+            "ANY_SELECT_TABLE",
+            "((ANY(SELECT_TABLE, METALAKE, CATALOG, SCHEMA, TABLE)) "
+                + "&& !(ANY(DENY_SELECT_TABLE, METALAKE, CATALOG, SCHEMA, TABLE)) )");
+    expression =
+        expression.replaceAll(
+            "ANY_MODIFY_TABLE",
+            "((ANY(MODIFY_TABLE, METALAKE, CATALOG, SCHEMA, TABLE)) "
+                + "&& !(ANY(DENY_MODIFY_TABLE, METALAKE, CATALOG, SCHEMA, TABLE)))");
+    expression =
+        expression.replaceAll(
+            "ANY_CREATE_TABLE",
+            "((ANY(CREATE_TABLE, METALAKE, CATALOG, SCHEMA, TABLE)) "
+                + "&& !(ANY(DENY_CREATE_TABLE, METALAKE, CATALOG, SCHEMA, TABLE)))");
+    expression =
+        expression.replaceAll(
+            "ANY_SELECT_VIEW",
+            "((ANY(SELECT_VIEW, METALAKE, CATALOG, SCHEMA, VIEW)) "
+                + "&& !(ANY(DENY_SELECT_VIEW, METALAKE, CATALOG, SCHEMA, VIEW)))");
+    expression =
+        expression.replaceAll(
+            "ANY_CREATE_VIEW",
+            "((ANY(CREATE_VIEW, METALAKE, CATALOG, SCHEMA)) "
+                + "&& !(ANY(DENY_CREATE_VIEW, METALAKE, CATALOG, SCHEMA)))");
+    expression =
+        expression.replaceAll(
+            "ANY_CREATE_FILESET",
+            "((ANY(CREATE_FILESET, METALAKE, CATALOG, SCHEMA)) "
+                + "&& !(ANY(DENY_CREATE_FILESET, METALAKE, CATALOG, SCHEMA)))");
+    expression =
+        expression.replaceAll(
+            "SCHEMA_OWNER_WITH_USE_CATALOG",
+            "SCHEMA::OWNER && "
+                + "((ANY(USE_CATALOG, METALAKE, CATALOG)) && "
+                + "!(ANY(DENY_USE_CATALOG, METALAKE, CATALOG)))");
+    expression =
+        expression.replaceAll(
+            "ANY_USE_MODEL",
+            "((ANY(USE_MODEL, METALAKE, CATALOG, SCHEMA, MODEL)) && "
+                + "!(ANY(DENY_USE_MODEL, METALAKE, CATALOG, SCHEMA, MODEL)))");
+    expression =
+        expression.replaceAll(
+            "ANY_LINK_MODEL_VERSION",
+            "((ANY(LINK_MODEL_VERSION, METALAKE, CATALOG, SCHEMA, MODEL)) "
+                + "&& !(ANY(DENY_LINK_MODEL_VERSION, METALAKE, CATALOG, SCHEMA, MODEL)))");
+    expression =
+        expression.replaceAll(
+            "ANY_REGISTER_MODEL",
+            "((ANY(REGISTER_MODEL, METALAKE, CATALOG, SCHEMA)) "
+                + "&& !(ANY(DENY_REGISTER_MODEL, METALAKE, CATALOG, SCHEMA)))");
+    expression =
+        expression.replaceAll(
+            "ANY_CREATE_TOPIC",
+            "((ANY(CREATE_TOPIC, METALAKE, CATALOG, SCHEMA, TOPIC)) "
+                + "&& !(ANY(DENY_CREATE_TOPIC, METALAKE, CATALOG, SCHEMA, TOPIC)))");
+    expression =
+        expression.replaceAll(
+            "ANY_PRODUCE_TOPIC",
+            "((ANY(PRODUCE_TOPIC, METALAKE, CATALOG, SCHEMA, TOPIC))"
+                + "&& !(ANY(DENY_PRODUCE_TOPIC, METALAKE, CATALOG, SCHEMA, TOPIC)))");
+    expression =
+        expression.replaceAll(
+            "ANY_CONSUME_TOPIC",
+            "((ANY(CONSUME_TOPIC, METALAKE, CATALOG, SCHEMA, TOPIC))"
+                + "&& !(ANY(DENY_CONSUME_TOPIC, METALAKE, CATALOG, SCHEMA, TOPIC)))");
+    expression =
+        expression.replaceAll(
+            "ANY_READ_FILESET",
+            "((ANY(READ_FILESET, METALAKE, CATALOG, SCHEMA, FILESET))"
+                + "&& !(ANY(DENY_READ_FILESET, METALAKE, CATALOG, SCHEMA, FILESET)))");
+    expression =
+        expression.replaceAll(
+            "ANY_WRITE_FILESET",
+            "((ANY(WRITE_FILESET, METALAKE, CATALOG, SCHEMA, FILESET))"
+                + "&& !(ANY(DENY_WRITE_FILESET, METALAKE, CATALOG, SCHEMA, FILESET)))");
+    expression =
+        expression.replaceAll(
+            "ANY_APPLY_TAG",
+            "((ANY(APPLY_TAG, METALAKE, TAG))" + "&& !(ANY(DENY_APPLY_TAG, METALAKE, TAG)))");
+    expression =
+        expression.replaceAll(
+            "ANY_APPLY_POLICY",
+            "((ANY(APPLY_POLICY, METALAKE, POLICY))"
+                + "&& !(ANY(DENY_APPLY_POLICY, METALAKE, POLICY)))");
+    expression =
+        expression.replaceAll(
+            "ANY_USE_JOB_TEMPLATE",
+            "((ANY(USE_JOB_TEMPLATE, METALAKE, JOB_TEMPLATE))"
+                + "&& !(ANY(DENY_USE_JOB_TEMPLATE, METALAKE, JOB_TEMPLATE)))");
+    expression =
+        expression.replaceAll(
+            CAN_SET_OWNER,
+            "authorizer.hasSetOwnerPermission(p_metalake,p_metadataObjectType,p_fullName,authorizationContext)");
+    expression =
+        expression.replaceAll(
+            CAN_OPERATE_METADATA_PRIVILEGE,
+            "authorizer.hasMetadataPrivilegePermission(p_metalake,p_type,p_fullName,authorizationContext)");
+    return expression;
+  }
+}

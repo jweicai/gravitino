@@ -1,0 +1,611 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+---
+openapi: 3.0.3
+info:
+  title: Gravitino REST API
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+  version: 1.2.0-SNAPSHOT
+  description: |
+    Defines the specification for the first version of the Gravitino REST API.
+
+servers:
+  - url: "{scheme}://{host}:{port}/{basePath}"
+    description: Generic base server URL, with all parts configurable.
+    variables:
+      scheme:
+        description: The scheme of the URI, either http or https.
+        default: http
+      host:
+        description: The host address for the specified server
+        default: localhost
+      port:
+        description: The port used when addressing the host
+        default: "8090"
+      basePath:
+        description: Optional prefix to be appended to all routes
+        default: "api"
+
+security:
+  - OAuth2WithJWT: [serviceAudience]
+  - BasicAuth: []
+
+paths:
+  /metalakes:
+    # escape the path name by replacing `/` with `~1`
+    $ref: "./metalakes.yaml#/paths/~1metalakes"
+
+  /metalakes/{name}:
+    # escape the path name by replacing `{ }` with `%7B %7D`
+    $ref: "./metalakes.yaml#/paths/~1metalakes~1%7Bname%7D"
+
+  /metalakes/{metalake}/tags:
+    $ref: "./tags.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1tags"
+
+  /metalakes/{metalake}/tags/{tag}:
+    $ref: "./tags.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1tags~1%7Btag%7D"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/tags:
+    $ref: "./tags.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1tags"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/policies:
+    $ref: "./policies.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1policies"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/statistics:
+    $ref: "./statistics.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1statistics"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/statistics/partitions:
+    $ref: "./statistics.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1statistics~1partitions"
+
+  /metalakes/{metalake}/policies:
+    $ref: "./policies.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1policies"
+
+  /metalakes/{metalake}/policies/{policy}:
+    $ref: "./policies.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1policies~1%7Bpolicy%7D"
+
+  /metalakes/{metalake}/policies/{policy}/objects:
+    $ref: "./policies.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1policies~1%7Bpolicy%7D~1objects"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/roles:
+    $ref: "./roles.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1roles"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/credentials:
+    $ref: "./credentials.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1credentials"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/tags/{tag}:
+    $ref: "./tags.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1tags~1%7Btag%7D"
+
+  /metalakes/{metalake}/objects/{metadataObjectType}/{metadataObjectFullName}/policies/{policy}:
+    $ref: "./policies.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1objects~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1policies~1%7Bpolicy%7D"
+
+  /metalakes/{metalake}/tags/{tag}/objects:
+    $ref: "./tags.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1tags~1%7Btag%7D~1objects"
+
+  /metalakes/{metalake}/catalogs:
+    $ref: "./catalogs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs"
+
+  /metalakes/{metalake}/catalogs/testConnection:
+    $ref: "./catalogs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1testConnection"
+
+  /metalakes/{metalake}/catalogs/{catalog}:
+    $ref: "./catalogs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas:
+    $ref: "./schemas.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}:
+    $ref: "./schemas.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/tables:
+    $ref: "./tables.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1tables"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/tables/{table}:
+    $ref: "./tables.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1tables~1%7Btable%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/tables/{table}/partitions:
+    $ref: "./partitions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1tables~1%7Btable%7D~1partitions"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/tables/{table}/partitions/{partition}:
+    $ref: "./partitions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1tables~1%7Btable%7D~1partitions~1%7Bpartition%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/filesets:
+    $ref: "./filesets.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1filesets"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/filesets/{fileset}:
+    $ref: "./filesets.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1filesets~1%7Bfileset%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/filesets/{fileset}/files:
+    $ref: "./filesets.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1filesets~1%7Bfileset%7D~1files"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/topics:
+    $ref: "./topics.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1topics"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/topics/{topic}:
+    $ref: "./topics.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1topics~1%7Btopic%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/functions:
+    $ref: "./functions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1functions"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/functions/{function}:
+    $ref: "./functions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1functions~1%7Bfunction%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models/{model}:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models~1%7Bmodel%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models/{model}/versions:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models~1%7Bmodel%7D~1versions"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models/{model}/versions/{version}:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models~1%7Bmodel%7D~1versions~1%7Bversion%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models/{model}/aliases/{alias}:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models~1%7Bmodel%7D~1aliases~1%7Balias%7D"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models/{model}/versions/{version}/uri:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models~1%7Bmodel%7D~1versions~1%7Bversion%7D~1uri"
+
+  /metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/models/{model}/aliases/{alias}/uri:
+    $ref: "./models.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1catalogs~1%7Bcatalog%7D~1schemas~1%7Bschema%7D~1models~1%7Bmodel%7D~1aliases~1%7Balias%7D~1uri"
+
+  /metalakes/{metalake}/users:
+    $ref: "./users.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1users"
+
+  /metalakes/{metalake}/users/{user}:
+    $ref: "./users.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1users~1%7Buser%7D"
+
+  /metalakes/{metalake}/groups:
+    $ref: "./groups.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1groups"
+
+  /metalakes/{metalake}/groups/{group}:
+    $ref: "./groups.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1groups~1%7Bgroup%7D"
+
+  /metalakes/{metalake}/roles:
+    $ref: "./roles.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1roles"
+
+  /metalakes/{metalake}/roles/{role}:
+    $ref: "./roles.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1roles~1%7Brole%7D"
+
+  /metalakes/{metalake}/owners/{metadataObjectType}/{metadataObjectFullName}:
+    $ref: "./owners.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1owners~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D"
+
+  /metalakes/{metalake}/permissions/users/{user}/grant:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1users~1%7Buser%7D~1grant"
+
+  /metalakes/{metalake}/permissions/users/{user}/revoke:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1users~1%7Buser%7D~1revoke"
+
+  /metalakes/{metalake}/permissions/groups/{group}/grant:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1groups~1%7Bgroup%7D~1grant"
+
+  /metalakes/{metalake}/permissions/groups/{group}/revoke:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1groups~1%7Bgroup%7D~1revoke"
+
+  /metalakes/{metalake}/permissions/roles/{role}/{metadataObjectType}/{metadataObjectFullName}/grant:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1roles~1%7Brole%7D~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1grant"
+
+  /metalakes/{metalake}/permissions/roles/{role}/{metadataObjectType}/{metadataObjectFullName}/revoke:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1roles~1%7Brole%7D~1%7BmetadataObjectType%7D~1%7BmetadataObjectFullName%7D~1revoke"
+
+  /metalakes/{metalake}/permissions/roles/{role}:
+    $ref: "./permissions.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1permissions~1roles~1%7Brole%7D"
+
+  /lineage:
+    $ref: "./lineage.yaml#/paths/~1lineage"
+
+  /metalakes/{metalake}/jobs/templates:
+    $ref: "./jobs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1jobs~1templates"
+
+  /metalakes/{metalake}/jobs/templates/{jobTemplate}:
+    $ref: "./jobs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1jobs~1templates~1%7BjobTemplate%7D"
+
+  /metalakes/{metalake}/jobs/runs:
+    $ref: "./jobs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1jobs~1runs"
+
+  /metalakes/{metalake}/jobs/runs/{jobId}:
+    $ref: "./jobs.yaml#/paths/~1metalakes~1%7Bmetalake%7D~1jobs~1runs~1%7BjobId%7D"
+
+components:
+
+  schemas:
+
+    Audit:
+      type: object
+      description: Audit information for a Gravitino resource.
+      properties:
+        creator:
+          type: string
+          description: The user who created the resource
+        createTime:
+          type: string
+          format: date-time
+          description: The time the resource was created
+        lastModifier:
+          type: string
+          description: The user who last modified the resource
+        lastModifiedTime:
+          type: string
+          format: date-time
+          description: The time the resource was last modified
+
+    ErrorModel:
+      type: object
+      description: JSON error payload returned in a response with further details on the error
+      required:
+        - message
+        - type
+        - code
+      properties:
+        code:
+          type: integer
+          minimum: 1000
+          maximum: 1100
+          description: HTTP response code
+          example: 1002
+        type:
+          type: string
+          description: Internal type definition of the error
+        message:
+          type: string
+          description: A human-readable message
+        stack:
+          type: array
+          items:
+            type: string
+
+    NameIdentifier:
+      type: object
+      description: A identifier for an entity
+      required:
+        - namespace
+        - name
+      properties:
+        namespace:
+          type: array
+          description: The namespace of the entity may be with multiple levels
+          items:
+            type: string
+        name:
+          type: string
+          description: The name of the entity
+
+    NameListResponse:
+      type: object
+      properties:
+        code:
+          type: integer
+          format: int32
+          description: Status code of the response
+          enum:
+            - 0
+        names:
+          type: array
+          items:
+            type: string
+
+  responses:
+    EntityListResponse:
+      description: A list of entities
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                format: int32
+                description: Status code of the response
+                enum:
+                  - 0
+                example: 0
+              identifiers:
+                type: array
+                description: A list of NameIdentifier objects
+                items:
+                  $ref: "#/components/schemas/NameIdentifier"
+          examples:
+            CatalogListResponse:
+              $ref: "./catalogs.yaml#/components/examples/CatalogListResponse"
+            SchemaListResponse:
+              $ref: "./schemas.yaml#/components/examples/SchemaListResponse"
+            TableListResponse:
+              $ref: "./tables.yaml#/components/examples/TableListResponse"
+
+
+    BadRequestErrorResponse:
+      description:
+        Indicates a bad request error. It could be caused by an unexpected request
+        body format or other forms of request validation failure, such as invalid json.
+        Usually serves application/json content, although in some cases simple text/plain content might
+        be returned by the server's middleware.
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            $ref: '#/components/schemas/ErrorModel'
+          example: {
+            "code": 1003,
+            "type": "BadRequestException",
+            "message": "Malformed request"
+          }
+
+    ServerErrorResponse:
+      description:
+        A server-side problem that might not be addressable from the client
+        side. Used for server 5xx errors without more specific documentation in
+        individual routes.
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            $ref: "#/components/schemas/ErrorModel"
+          example: {
+            "code": 1002,
+            "type": "RuntimeException",
+            "message": "Internal Server Error",
+            "stack": [
+              "java.lang.RuntimeException: Internal Server Error"
+            ]
+          }
+
+    DropResponse:
+      description: Represents a response for a drop operation
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                format: int32
+                description: Status code of the response
+                enum:
+                  - 0
+              dropped:
+                type: boolean
+                description: Whether the drop operation was successful
+
+    RemoveResponse:
+      description: Represents a response for a remove operation
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                format: int32
+                description: Status code of the response
+                enum:
+                  - 0
+              removed:
+                type: boolean
+                description: Whether the remove operation was successful
+
+    DeleteResponse:
+      description: Represents a response for a delete operation
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                format: int32
+                description: Status code of the response
+                enum:
+                  - 0
+              deleted:
+                type: boolean
+                description: Whether the delete operation was successful
+
+    SetResponse:
+      description: Represents a response for a set operation
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            type: object
+            properties:
+              code:
+                type: integer
+                format: int32
+                description: Status code of the response
+                enum:
+                  - 0
+              set:
+                type: boolean
+                description: Whether the set operation was successful
+
+    BaseResponse:
+      description: Represents a response for a base operation
+      content:
+        application/vnd.gravitino.v1+json:
+          schema:
+            type: object
+            required:
+              - code
+            properties:
+              code:
+                type: integer
+                format: int32
+                description: Status code of the response
+                enum:
+                  - 0
+          example: {
+            "code": 0
+          }
+
+  parameters:
+    metalake:
+      name: metalake
+      in: path
+      description: The name of the metalake
+      required: true
+      schema:
+        type: string
+
+    catalog:
+      name: catalog
+      in: path
+      description: The name of the catalog
+      required: true
+      schema:
+        type: string
+
+    schema:
+      name: schema
+      in: path
+      description: The name of the schema
+      required: true
+      schema:
+        type: string
+
+    table:
+      name: table
+      in: path
+      description: The name of the table
+      required: true
+      schema:
+        type: string
+
+    fileset:
+      name: fileset
+      in: path
+      description: The name of the fileset
+      required: true
+      schema:
+        type: string
+
+    topic:
+      name: topic
+      in: path
+      description: The name of the topic
+      required: true
+      schema:
+        type: string
+
+    model:
+      name: model
+      in: path
+      description: The name of the model
+      required: true
+      schema:
+        type: string
+
+    function:
+      name: function
+      in: path
+      description: The name of the function
+      required: true
+      schema:
+        type: string
+
+    tag:
+      name: tag
+      in: path
+      description: The name of the tag
+      required: true
+      schema:
+        type: string
+
+    policy:
+      name: policy
+      in: path
+      description: The name of the policy
+      required: true
+      schema:
+        type: string
+
+    user:
+      name: user
+      in: path
+      description: The name of the user
+      required: true
+      schema:
+        type: string
+
+    group:
+      name: group
+      in: path
+      description: The name of the group
+      required: true
+      schema:
+          type: string
+    role:
+      name: role
+      in: path
+      description: The name of the role
+      required: true
+      schema:
+        type: string
+
+    metadataObjectType:
+      name: metadataObjectType
+      in: path
+      description: The type of the metadata object
+      required: true
+      schema:
+        type: string
+        enum:
+          - "METALAKE"
+          - "CATALOG"
+          - "SCHEMA"
+          - "TABLE"
+          - "COLUMN"
+          - "FILESET"
+          - "TOPIC"
+          - "MODEL"
+          - "ROLE"
+    metadataObjectFullName:
+      name: metadataObjectFullName
+      in: path
+      description: The full name of the metadata object
+      required: true
+      schema:
+        type: string
+
+    force:
+      name: force
+      in: query
+      description: Force the operation to be executed
+      required: false
+      schema:
+        type: boolean
+        default: false
+
+  securitySchemes:
+
+    OAuth2WithJWT:
+      type: oauth2
+      description: OAuth2 with JWT
+      flows:
+        clientCredentials:
+          tokenUrl: https://external-oauth-server.com/token
+          scopes:
+            serviceAudience: The audience name when Gravitino uses OAuth as the authenticator.
+
+    BasicAuth:
+      type: http
+      scheme: basic
+
+    KerberosAuth:
+      type: http
+      scheme: negotiate
+

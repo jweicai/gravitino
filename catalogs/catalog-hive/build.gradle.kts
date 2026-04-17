@@ -1,0 +1,181 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+description = "catalog-hive"
+
+plugins {
+  `maven-publish`
+  id("java")
+  id("idea")
+}
+
+val scalaVersion: String = project.properties["scalaVersion"] as? String ?: extra["defaultScalaVersion"].toString()
+val sparkVersion: String = libs.versions.spark34.get()
+val icebergVersion: String = libs.versions.iceberg.get()
+val scalaCollectionCompatVersion: String = libs.versions.scala.collection.compat.get()
+
+dependencies {
+  compileOnly(project(":api"))
+  compileOnly(project(":common"))
+  compileOnly(project(":core"))
+
+  compileOnly(libs.immutables.value)
+  compileOnly(libs.lombok)
+
+  implementation(project(":catalogs:catalog-common")) {
+    exclude("*")
+  }
+  implementation(project(":catalogs:hive-metastore-common"))
+
+  implementation(libs.commons.collections3)
+  implementation(libs.commons.configuration1)
+  implementation(libs.commons.io)
+  implementation(libs.commons.lang3)
+  implementation(libs.guava)
+  implementation(libs.hadoop2.auth) {
+    exclude("*")
+  }
+  implementation(libs.hadoop2.common) {
+    exclude("*")
+  }
+  implementation(libs.htrace.core4)
+  implementation(libs.slf4j.api)
+  implementation(libs.woodstox.core)
+
+  annotationProcessor(libs.immutables.value)
+  annotationProcessor(libs.lombok)
+
+  testImplementation(project(":api"))
+  testImplementation(project(":catalogs:hadoop-common")) {
+    exclude("*")
+  }
+  testImplementation(project(":catalogs:hive-metastore-common", "testArtifacts"))
+  testImplementation(project(":clients:client-java"))
+  testImplementation(project(":common"))
+  testImplementation(project(":core"))
+  testImplementation(project(":integration-test-common", "testArtifacts"))
+  testImplementation(project(":server"))
+  testImplementation(project(":server-common"))
+
+  testImplementation("org.apache.spark:spark-hive_$scalaVersion:$sparkVersion") {
+    exclude("org.apache.hadoop")
+  }
+  testImplementation("org.apache.spark:spark-sql_$scalaVersion:$sparkVersion") {
+    exclude("org.apache.avro")
+    exclude("org.apache.hadoop")
+    exclude("org.apache.zookeeper")
+    exclude("io.dropwizard.metrics")
+    exclude("org.rocksdb")
+  }
+  testImplementation("org.scala-lang.modules:scala-collection-compat_$scalaVersion:$scalaCollectionCompatVersion")
+  testImplementation(libs.awaitility)
+  testImplementation(libs.bundles.jersey)
+  testImplementation(libs.bundles.jetty)
+  testImplementation(libs.bundles.log4j)
+  testImplementation(libs.hadoop2.aws)
+  testImplementation(libs.hadoop2.common) {
+    exclude("*")
+  }
+  testImplementation(libs.hadoop2.hdfs)
+  testImplementation(libs.hadoop2.mapreduce.client.core) {
+    exclude("*")
+  }
+  testImplementation(libs.hadoop3.abs)
+  testImplementation(libs.hadoop3.gcs)
+  testImplementation(libs.hive2.common) {
+    exclude("org.eclipse.jetty.aggregate", "jetty-all")
+    exclude("org.eclipse.jetty.orbit", "javax.servlet")
+  }
+  testImplementation(libs.junit.jupiter.api)
+  testImplementation(libs.mockito.core)
+  testImplementation(libs.mysql.driver)
+  testImplementation(libs.postgresql.driver)
+  testImplementation(libs.slf4j.api)
+  testImplementation(libs.testcontainers)
+  testImplementation(libs.testcontainers.localstack)
+  testImplementation(libs.testcontainers.mysql)
+
+  // You need this to run test CatalogHiveABSIT as it required hadoop3 environment introduced by hadoop3.abs
+  // (The protocol `abfss` was first introduced in Hadoop 3.2.0), However, as the there already exists
+  // hadoop2.common in the test classpath, If we added the following dependencies directly, it will
+  // cause the conflict between hadoop2 and hadoop3, resulting test failures, so we comment the
+  // following line temporarily, if you want to run the test, please uncomment it.
+  // In the future, we may need to refactor the test to avoid the conflict.
+  // testImplementation(libs.hadoop3.common)
+
+  testRuntimeOnly(libs.junit.jupiter.engine)
+}
+
+tasks {
+  register("runtimeJars", Copy::class) {
+    from(configurations.runtimeClasspath)
+    into("build/libs")
+  }
+
+  val copyCatalogLibs by registering(Copy::class) {
+    dependsOn("jar", "runtimeJars")
+    from("build/libs") {
+      exclude("guava-*.jar")
+      exclude("log4j-*.jar")
+      exclude("slf4j-*.jar")
+      // Exclude the following jars to avoid conflict with the jars in authorization-gcp
+      exclude("protobuf-java-*.jar")
+    }
+    into("$rootDir/distribution/package/catalogs/hive/libs")
+  }
+
+  val copyCatalogConfig by registering(Copy::class) {
+    from("src/main/resources")
+    into("$rootDir/distribution/package/catalogs/hive/conf")
+
+    include("hive.conf")
+    include("hive-site.xml.template")
+
+    rename { original ->
+      if (original.endsWith(".template")) {
+        original.replace(".template", "")
+      } else {
+        original
+      }
+    }
+
+    exclude { details ->
+      details.file.isDirectory()
+    }
+
+    fileMode = 0b111101101
+  }
+
+  register("copyLibAndConfig", Copy::class) {
+    dependsOn(copyCatalogConfig, copyCatalogLibs)
+  }
+}
+
+tasks.test {
+  val skipITs = project.hasProperty("skipITs")
+  if (skipITs) {
+    // Exclude integration tests
+    exclude("**/integration/test/**")
+  } else {
+    dependsOn(tasks.jar)
+  }
+}
+
+tasks.getByName("generateMetadataFileForMavenJavaPublication") {
+  dependsOn("runtimeJars")
+}
