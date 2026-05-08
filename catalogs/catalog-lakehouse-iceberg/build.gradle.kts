@@ -38,7 +38,11 @@ dependencies {
   compileOnly(libs.lombok)
 
   implementation(project(":catalogs:catalog-common"))
-  implementation(project(":iceberg:iceberg-common"))
+  implementation(project(":iceberg:iceberg-common")) {
+    exclude(module = "api")
+    exclude(module = "core")
+    exclude(module = "common")
+  }
 
   implementation(libs.asm)
   implementation(libs.bundles.iceberg)
@@ -110,6 +114,7 @@ tasks {
       exclude("guava-*.jar")
       exclude("log4j-*.jar")
       exclude("slf4j-*.jar")
+      exclude("error_prone_annotations-*.jar")
     }
     into("$rootDir/distribution/package/catalogs/lakehouse-iceberg/libs")
   }

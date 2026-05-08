@@ -31,15 +31,13 @@ dependencies {
   compileOnly(libs.hive2.metastore)
   compileOnly(libs.immutables.value)
   compileOnly(libs.lombok)
+  compileOnly(libs.caffeine)
+  compileOnly(libs.guava)
+  compileOnly(libs.slf4j.api)
 
   implementation(project(":catalogs:catalog-common")) {
     exclude("*")
   }
-  implementation(project(":clients:client-java-runtime", configuration = "shadow"))
-
-  implementation(libs.caffeine)
-  implementation(libs.guava)
-  implementation(libs.slf4j.api)
 
   annotationProcessor(libs.immutables.value)
   annotationProcessor(libs.lombok)
@@ -57,15 +55,20 @@ dependencies {
   testImplementation(libs.datanucleus.jdo)
   testImplementation(libs.datanucleus.rdbms)
   testImplementation(libs.derby)
-  testImplementation(libs.hadoop2.auth) {
+  testImplementation(libs.hadoop3.auth) {
     exclude("*")
   }
-  testImplementation(libs.hadoop2.common) {
+  testImplementation(libs.hadoop3.common) {
     exclude("*")
   }
-  testImplementation(libs.hadoop2.mapreduce.client.core) {
+  testImplementation(libs.hadoop3.mapreduce.client.core) {
     exclude("*")
   }
+  // Hadoop 3.x runtime requirements (stripped by exclude("*") above)
+  testImplementation(libs.hadoop3.shaded.guava)
+  testImplementation(libs.hadoop3.shaded.protobuf)
+  testImplementation(libs.commons.configuration2)
+  testImplementation(libs.re2j)
   testImplementation(libs.hive2.exec) {
     artifact {
       classifier = "core"
@@ -118,6 +121,7 @@ dependencies {
     exclude("org.slf4j")
   }
   testImplementation(libs.htrace.core4)
+  testImplementation(libs.caffeine)
   testImplementation(libs.junit.jupiter.api)
   testImplementation(libs.mockito.core)
   testImplementation(libs.testcontainers)
